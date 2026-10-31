@@ -7,7 +7,13 @@ Bot Discord personnel configuré pour **un seul serveur**, avec détection des v
 1. Installer Node.js 18.17+ puis lancer `npm ci` (ou `npm install` si le lockfile n'est pas disponible).
 2. Éditer `config.json` : renseigner le token du bot, l'ID du serveur, les IDs de salons/rôle, les listes d'exemption, seuils et actions.
 3. Dans le Developer Portal Discord, activer **Server Members Intent** et **Message Content Intent**. Donner au bot les permissions nécessaires : voir les salons, lire/modérer les messages, gérer les messages, gérer les rôles et modérer les membres (timeout). Pour détecter actions via les journaux d'audit, lui accorder **View Audit Log**. Placer son rôle au-dessus du rôle de quarantaine et des rôles des membres qu'il doit modérer.
-4. Démarrer avec `npm start`.
+4. Lors de l’invitation OAuth du bot, inclure les scopes `bot` et `applications.commands`, puis démarrer avec `npm start`.
+
+## Whitelist par commande
+
+Dans le serveur configuré, seul l’utilisateur Discord `1239641924407660604` peut utiliser `/wl` : `ajouter-personne`, `retirer-personne`, `ajouter-role` ou `retirer-role`. Les autres utilisateurs reçoivent un refus privé. Chaque action répond avec un embed privé et sauvegarde automatiquement les IDs dans `whitelist.json` à côté du bot. Ce fichier est local et ignoré par Git; `whitelist.example.json` montre son format. Le bot enregistre la commande de serveur au démarrage.
+
+Les bots tiers ne sont pas exemptés par défaut : ils peuvent être détectés et sanctionnés comme les autres membres, sous réserve des permissions et de la hiérarchie des rôles Discord. Seul le bot anti-raid lui-même est exempté.
 
 ## Configuration
 

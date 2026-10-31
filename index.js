@@ -1,9 +1,16 @@
-const { Client, GatewayIntentBits, Partials, AuditLogEvent, PermissionsBitField } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, AuditLogEvent, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 const fs = require('node:fs');
 const path = require('node:path');
 
 const configPath = path.join(__dirname, 'config.json');
 const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+const whitelistPath = path.join(__dirname, 'whitelist.json');
+if (fs.existsSync(whitelistPath)) {
+  const savedWhitelist = JSON.parse(fs.readFileSync(whitelistPath, 'utf8'));
+  config.whitelist = { userIds: savedWhitelist.userIds || [], roleIds: savedWhitelist.roleIds || [] };
+} else {
+  config.whitelist ||= { userIds: [], roleIds: [] };
+}
 if (!config.token || /^(COLLER_|REMPLACER_|YOUR_)/i.test(config.token)) throw new Error('Renseignez le vrai token du bot dans config.json');
 if (!/^\d{17,20}$/.test(config.guildId || '')) throw new Error('Renseignez un guildId Discord valide dans config.json');
 const guildId = config.guildId;
@@ -13,8 +20,54 @@ const userMessages = new Map();
 const warned = new Map();
 
 function exempt(member) {
-  return !member || member.id === member.guild.ownerId || member.user?.bot ||
+  return !member || member.id === member.guild.ownerId || member.id === client.user?.id ||
     config.whitelist.userIds.includes(member.id) || member.roles?.cache?.some(r => config.whitelist.roleIds.includes(r.id));
+}
+function saveWhitelist() {
+  const temporaryPath = `${whitelistPath}.tmp`;
+  fs.writeFileSync(temporaryPath, `${JSON.stringify(config.whitelist, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(temporaryPath, whitelistPath);
+}
+const whitelistCommand = new SlashCommandBuilder().setName('wl').setDescription('Gérer la whitelist anti-raid')
+  .addSubcommand(s => s.setName('ajouter-personne').setDescription('Exempter une personne')
+    .addUserOption(o => o.setName('personne').setDescription('Personne à ajouter').setRequired(true)))
+  .addSubcommand(s => s.setName('retirer-personne').setDescription('Retirer une personne de la whitelist')
+    .addUserOption(o => o.setName('personne').setDescription('Personne à retirer').setRequired(true)))
+  .addSubcommand(s => s.setName('ajouter-role').setDescription('Exempter les membres ayant un rôle')
+    .addRoleOption(o => o.setName('role').setDescription('Rôle à ajouter').setRequired(true)))
+  .addSubcommand(s => s.setName('retirer-role').setDescription('Retirer un rôle de la whitelist')
+    .addRoleOption(o => o.setName('role').setDescription('Rôle à retirer').setRequired(true)));
+async function handleWhitelistCommand(interaction) {
+  if (!interaction.isChatInputCommand() || interaction.commandName !== 'wl') return;
+  if (interaction.guildId !== guildId) return interaction.reply({ content: 'Cette commande est réservée au serveur configuré.', ephemeral: true });
+  if (interaction.user.id !== '1239641924407660604') {
+    return interaction.reply({ content: 'Tu n’es pas autorisé à gérer la whitelist.', ephemeral: true });
+  }
+  const subcommand = interaction.options.getSubcommand();
+  const isUser = subcommand.endsWith('personne');
+  const target = isUser ? interaction.options.getUser('personne') : interaction.options.getRole('role');
+  const list = isUser ? config.whitelist.userIds : config.whitelist.roleIds;
+  const adding = subcommand.startsWith('ajouter-');
+  const index = list.indexOf(target.id);
+  const changed = adding ? index === -1 : index !== -1;
+  if (changed) {
+    if (adding) list.push(target.id);
+    else list.splice(index, 1);
+    try { saveWhitelist(); }
+    catch (error) {
+      if (adding) list.splice(list.indexOf(target.id), 1); else list.push(target.id);
+      console.error('Impossible de sauvegarder la whitelist:', error);
+      return interaction.reply({ content: 'Échec de sauvegarde de whitelist.json. Vérifie les permissions du dossier.', ephemeral: true });
+    }
+  }
+  const actionText = adding ? 'ajoutée à' : 'retirée de';
+  const embed = new EmbedBuilder()
+    .setColor(adding ? 0x2ecc71 : 0xe67e22)
+    .setTitle('Whitelist anti-raid')
+    .setDescription(`${isUser ? `<@${target.id}>` : `<@&${target.id}>`} ${changed ? actionText : (adding ? 'était déjà dans' : 'ne figurait pas dans')} la whitelist.`)
+    .setFooter({ text: `ID : ${target.id} • Enregistrement ${changed ? 'sauvegardé dans whitelist.json' : 'inchangé'}` })
+    .setTimestamp();
+  return interaction.reply({ embeds: [embed], ephemeral: true });
 }
 function record(key, windowMs) {
   const now = Date.now();
@@ -49,7 +102,7 @@ async function punish(member, action, duration, reason) {
   } catch (e) { console.error(`Sanction impossible (${member.id}):`, e.message); }
 }
 async function counterGuard(guild, executor, counter, reason) {
-  if (!executor || !executor.id || executor.bot) return;
+  if (!executor || !executor.id) return;
   const member = await guild.members.fetch(executor.id).catch(() => null);
   if (exempt(member)) return;
   await punish(member, config.actions.onDestructiveRaid, 0, `Anti-raid : ${reason}`);
@@ -63,7 +116,17 @@ async function guardEvent(guild, targetId, auditType, key, reason) {
   await counterGuard(guild, exec, key, reason);
 }
 
-client.once('ready', () => console.log(`Connecté en tant que ${client.user.tag} — serveur ${guildId}`));
+client.once('ready', async () => {
+  try {
+    await client.application.commands.set([whitelistCommand.toJSON()], guildId);
+    console.log('Commandes /wl enregistrées sur le serveur configuré.');
+  } catch (error) { console.error('Impossible d’enregistrer /wl :', error.message); }
+  console.log(`Connecté en tant que ${client.user.tag} — serveur ${guildId}`);
+});
+client.on('interactionCreate', interaction => handleWhitelistCommand(interaction).catch(error => {
+  console.error('Erreur dans la commande /wl :', error);
+  if (!interaction.replied && !interaction.deferred) interaction.reply({ content: 'Une erreur est survenue pendant la commande.', ephemeral: true }).catch(() => {});
+}));
 client.on('guildMemberAdd', async member => {
   if (member.guild.id !== guildId) return;
   const cfg = limit('joins');
@@ -73,7 +136,7 @@ client.on('guildMemberAdd', async member => {
   }
 });
 client.on('messageCreate', async message => {
-  if (!message.guild || message.guild.id !== guildId || message.author.bot || !message.member || exempt(message.member)) return;
+  if (!message.guild || message.guild.id !== guildId || !message.member || exempt(message.member)) return;
   if (config.spam.ignoredChannelIds.includes(message.channelId)) return;
   const settings = limit('messages'); const key = `${message.guild.id}:${message.author.id}`; const now = Date.now();
   const list = (userMessages.get(key) || []).filter(x => now - x.time < settings.windowMs);
