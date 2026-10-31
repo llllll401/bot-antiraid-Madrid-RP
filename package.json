@@ -1,0 +1,9 @@
+{
+  "name": "madrid-rp-antiraid",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Bot anti-raid Discord mono-serveur",
+  "main": "index.js",
+  "scripts": { "start": "node index.js" },
+  "dependencies": { "discord.js": "^14.14.1" }
+}

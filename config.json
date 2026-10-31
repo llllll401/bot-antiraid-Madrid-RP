@@ -1,0 +1,27 @@
+{
+  "token": "COLLER_LE_TOKEN_DU_BOT_ICI",
+  "guildId": "ID_DU_SERVEUR",
+  "logChannelId": "",
+  "quarantineRoleId": "",
+  "whitelist": { "userIds": [], "roleIds": [] },
+  "limits": {
+    "joins": { "count": 7, "windowMs": 20000 },
+    "messages": { "count": 5, "windowMs": 5000 },
+    "repeatedMessages": { "count": 4, "windowMs": 5000 },
+    "channelDeletes": { "count": 4, "windowMs": 15000 },
+    "channelCreates": { "count": 4, "windowMs": 15000 },
+    "roleDeletes": { "count": 5, "windowMs": 30000 },
+    "roleCreates": { "count": 5, "windowMs": 30000 },
+    "bans": { "count": 3, "windowMs": 30000 },
+    "kicks": { "count": 5, "windowMs": 30000 },
+    "timeouts": { "count": 5, "windowMs": 30000 }
+  },
+  "actions": {
+    "onRaidJoin": "quarantine",
+    "onSpam": "timeout",
+    "spamTimeoutMs": 600000,
+    "onDestructiveRaid": "removeRoles",
+    "raidTimeoutMs": 3600000
+  },
+  "spam": { "warnAt": 3, "deleteMessages": true, "maxAttachments": 8, "ignoredChannelIds": [] }
+}
