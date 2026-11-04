@@ -1,28 +1,27 @@
-# Bot anti-raid mono-serveur
+# Gestion des absences Discord
 
-Bot Discord personnel configuré pour **un seul serveur**, avec détection des vagues d'arrivées, du spam/répétition de messages, et des actions massives (création/suppression de salons ou rôles, bans, kicks et timeouts). Les alertes/commandes liées à la blacklist et aux alertes du projet source ne sont pas reprises. Les journaux de détection sont des logs opérationnels dans le salon configuré.
+Bot pour un seul serveur Discord : panneau de demandes avec formulaire, validation/refus via le salon réservé, et panneau public des absences actuellement en cours. Les permissions d’accès aux trois salons définissent qui peut demander et traiter une absence : le bot n’impose aucun rôle spécial.
 
-## Installation
+## Installation rapide
 
-1. Installer Node.js 18.17+ puis lancer `npm ci` (ou `npm install` si le lockfile n'est pas disponible).
-2. Éditer `config.json` : renseigner le token du bot, l'ID du serveur, les IDs de salons/rôle, les listes d'exemption, seuils et actions.
-3. Dans le Developer Portal Discord, activer **Server Members Intent** et **Message Content Intent**. Donner au bot les permissions nécessaires : voir les salons, lire/modérer les messages, gérer les messages, gérer les rôles et modérer les membres (timeout). Pour détecter actions via les journaux d'audit, lui accorder **View Audit Log**. Placer son rôle au-dessus du rôle de quarantaine et des rôles des membres qu'il doit modérer.
-4. Lors de l’invitation OAuth du bot, inclure les scopes `bot` et `applications.commands`, puis démarrer avec `npm start`.
+1. Utiliser Node.js 18 ou plus récent, puis lancer `npm ci`.
+2. Compléter `config.json` : token du bot, ID du serveur et IDs des trois salons.
+3. Inviter le bot avec le scope `bot` et les permissions nécessaires pour voir et envoyer des messages, intégrer des liens, gérer ses propres messages et envoyer des messages privés. Il doit pouvoir accéder aux trois salons. Aucun intent privilégié n’est nécessaire.
+4. Lancer `npm start`.
 
-## Whitelist par commande
+Au démarrage, le bot supprime les anciennes commandes slash enregistrées pour son application (globales et propres au serveur), puis poste/récupère les panneaux et restaure les demandes en attente. Il n’utilise plus l’antiraid ni la whitelist.
 
-Dans le serveur configuré, seul l’utilisateur Discord `1239641924407660604` peut utiliser `/wl` : `ajouter-personne`, `retirer-personne`, `ajouter-role` ou `retirer-role`. Les autres utilisateurs reçoivent un refus privé. Chaque action répond avec un embed privé et sauvegarde automatiquement les IDs dans `whitelist.json` à côté du bot. Ce fichier est local et ignoré par Git; `whitelist.example.json` montre son format. Le bot enregistre la commande de serveur au démarrage.
+## Salons dans `config.json`
 
-Les bots tiers ne sont pas exemptés par défaut : ils peuvent être détectés et sanctionnés comme les autres membres, sous réserve des permissions et de la hiérarchie des rôles Discord. Seul le bot anti-raid lui-même est exempté.
+- `absenceBoardChannelId` : panneau actualisé chaque minute avec les absences **acceptées et en cours**. Les demandes futures et les absences terminées n’y figurent pas.
+- `absenceRequestChannelId` : panneau avec bouton ouvrant le formulaire de demande.
+- `absenceReviewChannelId` : demandes avec boutons Accepter/Refuser. Le refus ouvre un formulaire de motif ; le bot envoie ce motif en MP à la personne ayant fait la demande.
+- `timezone` : fuseau des heures entrées et affichées, par défaut `Europe/Paris`.
 
-## Configuration
+Entrer les dates au format `JJ/MM/AAAA HH:MM`, par exemple `05/11/2026 14:30`. Le bot vérifie le format, la validité des dates, que le retour suit le départ et que le départ n’est pas passé. Les horaires inexistants lors du changement d’heure sont refusés.
 
-- `guildId` limite strictement le traitement à ce serveur.
-- `whitelist.userIds` et `whitelist.roleIds` désignent les comptes/rôles exemptés (le propriétaire et les bots sont automatiquement ignorés pour les sanctions).
-- `limits` définit les fenêtres en millisecondes et seuils de détection.
-- `actions.onRaidJoin` : `quarantine` applique le rôle si `quarantineRoleId` est défini. Autre valeur : pas de rôle automatique.
-- `actions.onSpam` : `timeout` applique un timeout; `spamTimeoutMs` règle sa durée.
-- `actions.onDestructiveRaid` : `removeRoles` retire les rôles modifiables et applique un timeout. Cette sanction ne restaure pas automatiquement les salons/rôles supprimés.
-- `logChannelId` peut rester vide; les erreurs restent visibles dans la console.
+## Stockage et panneaux
 
-**Sécurité :** ne partagez jamais le token. `config.json` est ignoré par Git; gardez le token uniquement dans votre copie locale. Réinitialisez-le immédiatement s'il a été exposé. Le bot n'est pas un remplacement de sauvegardes ni des protections natives Discord.
+Les absences, leur statut, ainsi que les IDs des messages de panneau sont stockés dans `absences.json` à côté du bot (créé automatiquement, ignoré par Git). Le tableau des absences utilise cet ID et édite le message chaque minute. Si le message a été supprimé ou n’est plus accessible, le bot en crée un nouveau et sauvegarde son ID. Le panneau de demande est récupéré/recréé de la même manière. Les demandes en attente sont conservées au redémarrage.
+
+Configure les permissions Discord des salons pour contrôler l’accès : les personnes pouvant voir le salon des demandes peuvent soumettre une demande ; celles pouvant voir le salon de validation peuvent traiter les boutons. Une personne doit autoriser les messages privés du bot pour recevoir le motif d’un refus.

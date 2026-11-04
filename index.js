@@ -1,178 +1,249 @@
-const { Client, GatewayIntentBits, Partials, AuditLogEvent, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
+const {
+  ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, EmbedBuilder, GatewayIntentBits,
+  ModalBuilder, TextInputBuilder, TextInputStyle
+} = require('discord.js');
 const fs = require('node:fs');
 const path = require('node:path');
+const { randomUUID } = require('node:crypto');
 
 const configPath = path.join(__dirname, 'config.json');
 const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-const whitelistPath = path.join(__dirname, 'whitelist.json');
-if (fs.existsSync(whitelistPath)) {
-  const savedWhitelist = JSON.parse(fs.readFileSync(whitelistPath, 'utf8'));
-  config.whitelist = { userIds: savedWhitelist.userIds || [], roleIds: savedWhitelist.roleIds || [] };
-} else {
-  config.whitelist ||= { userIds: [], roleIds: [] };
-}
-if (!config.token || /^(COLLER_|REMPLACER_|YOUR_)/i.test(config.token)) throw new Error('Renseignez le vrai token du bot dans config.json');
+if (!config.token || /^(COLLER_|REMPLACER_|YOUR_)/i.test(config.token)) throw new Error('Renseignez le vrai token dans config.json');
 if (!/^\d{17,20}$/.test(config.guildId || '')) throw new Error('Renseignez un guildId Discord valide dans config.json');
+for (const field of ['absenceBoardChannelId', 'absenceRequestChannelId', 'absenceReviewChannelId']) {
+  if (!/^\d{17,20}$/.test(config[field] || '')) throw new Error(`Renseignez ${field} dans config.json`);
+}
 const guildId = config.guildId;
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildModeration], partials: [Partials.Message, Partials.Channel] });
-const buckets = new Map();
-const userMessages = new Map();
-const warned = new Map();
+const statePath = path.join(__dirname, 'absences.json');
+const timezone = config.timezone || 'Europe/Paris';
+const dateFormatter = new Intl.DateTimeFormat('fr-FR', {
+  timeZone: timezone, day: '2-digit', month: '2-digit', year: 'numeric',
+  hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+});
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-function exempt(member) {
-  return !member || member.id === member.guild.ownerId || member.id === client.user?.id ||
-    config.whitelist.userIds.includes(member.id) || member.roles?.cache?.some(r => config.whitelist.roleIds.includes(r.id));
-}
-function saveWhitelist() {
-  const temporaryPath = `${whitelistPath}.tmp`;
-  fs.writeFileSync(temporaryPath, `${JSON.stringify(config.whitelist, null, 2)}\n`, { mode: 0o600 });
-  fs.renameSync(temporaryPath, whitelistPath);
-}
-const whitelistCommand = new SlashCommandBuilder().setName('wl').setDescription('Gérer la whitelist anti-raid')
-  .addSubcommand(s => s.setName('ajouter-personne').setDescription('Exempter une personne')
-    .addUserOption(o => o.setName('personne').setDescription('Personne à ajouter').setRequired(true)))
-  .addSubcommand(s => s.setName('retirer-personne').setDescription('Retirer une personne de la whitelist')
-    .addUserOption(o => o.setName('personne').setDescription('Personne à retirer').setRequired(true)))
-  .addSubcommand(s => s.setName('ajouter-role').setDescription('Exempter les membres ayant un rôle')
-    .addRoleOption(o => o.setName('role').setDescription('Rôle à ajouter').setRequired(true)))
-  .addSubcommand(s => s.setName('retirer-role').setDescription('Retirer un rôle de la whitelist')
-    .addRoleOption(o => o.setName('role').setDescription('Rôle à retirer').setRequired(true)));
-async function handleWhitelistCommand(interaction) {
-  if (!interaction.isChatInputCommand() || interaction.commandName !== 'wl') return;
-  if (interaction.guildId !== guildId) return interaction.reply({ content: 'Cette commande est réservée au serveur configuré.', ephemeral: true });
-  if (interaction.user.id !== '1239641924407660604') {
-    return interaction.reply({ content: 'Tu n’es pas autorisé à gérer la whitelist.', ephemeral: true });
-  }
-  const subcommand = interaction.options.getSubcommand();
-  const isUser = subcommand.endsWith('personne');
-  const target = isUser ? interaction.options.getUser('personne') : interaction.options.getRole('role');
-  const list = isUser ? config.whitelist.userIds : config.whitelist.roleIds;
-  const adding = subcommand.startsWith('ajouter-');
-  const index = list.indexOf(target.id);
-  const changed = adding ? index === -1 : index !== -1;
-  if (changed) {
-    if (adding) list.push(target.id);
-    else list.splice(index, 1);
-    try { saveWhitelist(); }
-    catch (error) {
-      if (adding) list.splice(list.indexOf(target.id), 1); else list.push(target.id);
-      console.error('Impossible de sauvegarder la whitelist:', error);
-      return interaction.reply({ content: 'Échec de sauvegarde de whitelist.json. Vérifie les permissions du dossier.', ephemeral: true });
-    }
-  }
-  const actionText = adding ? 'ajoutée à' : 'retirée de';
-  const embed = new EmbedBuilder()
-    .setColor(adding ? 0x2ecc71 : 0xe67e22)
-    .setTitle('Whitelist anti-raid')
-    .setDescription(`${isUser ? `<@${target.id}>` : `<@&${target.id}>`} ${changed ? actionText : (adding ? 'était déjà dans' : 'ne figurait pas dans')} la whitelist.`)
-    .setFooter({ text: `ID : ${target.id} • Enregistrement ${changed ? 'sauvegardé dans whitelist.json' : 'inchangé'}` })
-    .setTimestamp();
-  return interaction.reply({ embeds: [embed], ephemeral: true });
-}
-function record(key, windowMs) {
-  const now = Date.now();
-  const arr = (buckets.get(key) || []).filter(t => now - t < windowMs);
-  arr.push(now); buckets.set(key, arr); return arr.length;
-}
-function limit(name) { return config.limits[name]; }
-async function log(guild, text) {
-  if (!config.logChannelId) return;
-  const ch = await guild.channels.fetch(config.logChannelId).catch(() => null);
-  if (ch?.isTextBased()) await ch.send({ content: text }).catch(() => {});
-}
-async function auditExecutor(guild, type, targetId) {
-  const logs = await guild.fetchAuditLogs({ type, limit: 6 }).catch(() => null);
-  const entry = logs?.entries.find(e => String(e.targetId || '') === String(targetId) && Date.now() - e.createdTimestamp < 15000);
-  return entry?.executor || null;
-}
-async function punish(member, action, duration, reason) {
-  if (!member || exempt(member)) return;
+function loadState() {
   try {
-    if (action === 'quarantine' && config.quarantineRoleId) {
-      await member.roles.add(config.quarantineRoleId, reason); return;
+    const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    return {
+      boardMessageId: state.boardMessageId || null,
+      requestPanelMessageId: state.requestPanelMessageId || null,
+      absences: Array.isArray(state.absences) ? state.absences : []
+    };
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw new Error(`Impossible de lire ${statePath}: ${error.message}`);
+    return { boardMessageId: null, requestPanelMessageId: null, absences: [] };
+  }
+}
+const state = loadState();
+function saveState() {
+  const tmp = `${statePath}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(tmp, statePath);
+}
+function dateParts(timestamp) {
+  return Object.fromEntries(dateFormatter.formatToParts(new Date(timestamp)).filter(p => p.type !== 'literal').map(p => [p.type, Number(p.value)]));
+}
+function toTimestamp(input) {
+  const match = /^(\d{2})\/(\d{2})\/(\d{4}) (\d{2}):(\d{2})$/.exec(input.trim());
+  if (!match) throw new Error('Format attendu : JJ/MM/AAAA HH:MM (ex. 05/11/2026 14:30).');
+  const [, dd, mm, yyyy, hh, min] = match.map(Number);
+  const naive = Date.UTC(yyyy, mm - 1, dd, hh, min);
+  const calendar = new Date(naive);
+  if (calendar.getUTCFullYear() !== yyyy || calendar.getUTCMonth() !== mm - 1 || calendar.getUTCDate() !== dd || hh > 23 || min > 59) {
+    throw new Error('Date ou heure invalide.');
+  }
+  const wanted = { day: dd, month: mm, year: yyyy, hour: hh, minute: min };
+  let guess = naive;
+  for (let i = 0; i < 4; i++) {
+    const p = dateParts(guess);
+    const representedAsUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute);
+    guess = naive - (representedAsUtc - guess);
+  }
+  const actual = dateParts(guess);
+  if (Object.keys(wanted).some(key => wanted[key] !== actual[key])) throw new Error(`Cette date/heure n’existe pas dans le fuseau ${timezone} (changement d’heure).`);
+  return guess;
+}
+function displayDate(timestamp) { return dateFormatter.format(new Date(timestamp)); }
+function safeText(value, max = 500) { return String(value || '').replace(/@/g, '@\u200b').slice(0, max); }
+function createPanelEmbed() {
+  return new EmbedBuilder().setColor(0x5865f2).setTitle('Déclarer une absence')
+    .setDescription('Clique sur le bouton ci-dessous puis indique le motif, la date et l’heure de départ et de retour. Les dates sont au format **JJ/MM/AAAA HH:MM** (heure locale du serveur).')
+    .setFooter({ text: 'Une demande sera envoyée au salon de validation.' });
+}
+function createPanelRow() {
+  return new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('absence:create').setLabel('Créer une demande d’absence').setStyle(ButtonStyle.Primary));
+}
+function createRequestModal() {
+  return new ModalBuilder().setCustomId('absence:submit').setTitle('Demande d’absence').addComponents(
+    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Motif de l’absence').setStyle(TextInputStyle.Paragraph).setMaxLength(800).setRequired(true)),
+    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('start').setLabel('Départ (JJ/MM/AAAA HH:MM)').setPlaceholder('05/11/2026 14:30').setStyle(TextInputStyle.Short).setMaxLength(16).setRequired(true)),
+    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('end').setLabel('Retour (JJ/MM/AAAA HH:MM)').setPlaceholder('08/11/2026 18:00').setStyle(TextInputStyle.Short).setMaxLength(16).setRequired(true))
+  );
+}
+function formatReviewEmbed(absence) {
+  return new EmbedBuilder().setColor(absence.status === 'pending' ? 0xf1c40f : absence.status === 'approved' ? 0x2ecc71 : 0xe74c3c)
+    .setTitle(absence.status === 'pending' ? 'Demande d’absence à traiter' : `Demande ${absence.status === 'approved' ? 'acceptée' : 'refusée'}`)
+    .setDescription(`**Personne :** <@${absence.userId}>\n**Motif :** ${safeText(absence.reason)}\n**Départ :** ${displayDate(absence.startAt)}\n**Retour :** ${displayDate(absence.endAt)}${absence.decisionReason ? `\n**Motif du refus :** ${safeText(absence.decisionReason)}` : ''}`)
+    .setFooter({ text: `Demande ${absence.id}` }).setTimestamp(absence.createdAt);
+}
+function reviewButtons(absence) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`absence:approve:${absence.id}`).setLabel('Accepter').setStyle(ButtonStyle.Success).setDisabled(absence.status !== 'pending'),
+    new ButtonBuilder().setCustomId(`absence:reject:${absence.id}`).setLabel('Refuser').setStyle(ButtonStyle.Danger).setDisabled(absence.status !== 'pending')
+  );
+}
+function boardEmbed() {
+  const now = Date.now();
+  const current = state.absences.filter(a => a.status === 'approved' && a.startAt <= now && a.endAt > now).sort((a, b) => a.endAt - b.endAt);
+  const embed = new EmbedBuilder().setColor(0x3498db).setTitle('Absences en cours').setTimestamp();
+  if (!current.length) embed.setDescription('Aucune absence en cours.');
+  else embed.setDescription(current.slice(0, 25).map(a => `• <@${a.userId}> — **${safeText(a.reason, 180)}**\n  Retour prévu : ${displayDate(a.endAt)}`).join('\n\n').slice(0, 4000));
+  embed.setFooter({ text: `Mis à jour chaque minute • Fuseau : ${timezone}` });
+  return embed;
+}
+async function fetchTextChannel(id) {
+  const channel = await client.channels.fetch(id).catch(() => null);
+  if (!channel?.isTextBased() || !channel.messages) throw new Error(`Le salon ${id} est introuvable ou n’est pas un salon textuel accessible.`);
+  return channel;
+}
+async function ensureMessage(channelId, stateKey, payload) {
+  const channel = await fetchTextChannel(channelId);
+  const existingId = state[stateKey];
+  if (existingId) {
+    const existing = await channel.messages.fetch(existingId).catch(() => null);
+    if (existing && existing.author.id === client.user.id) {
+      await existing.edit(payload);
+      return existing;
     }
-    if (action === 'removeRoles') {
-      const removable = member.roles.cache.filter(r => r.id !== member.guild.id && r.editable);
-      if (removable.size) await member.roles.remove(removable, reason);
-      const ms = config.actions.raidTimeoutMs;
-      if (member.moderatable && ms) await member.timeout(ms, reason);
-      return;
-    }
-    if (action === 'timeout' && member.moderatable) await member.timeout(duration || 600000, reason);
-  } catch (e) { console.error(`Sanction impossible (${member.id}):`, e.message); }
+  }
+  const message = await channel.send(payload);
+  state[stateKey] = message.id;
+  saveState();
+  return message;
 }
-async function counterGuard(guild, executor, counter, reason) {
-  if (!executor || !executor.id) return;
-  const member = await guild.members.fetch(executor.id).catch(() => null);
-  if (exempt(member)) return;
-  await punish(member, config.actions.onDestructiveRaid, 0, `Anti-raid : ${reason}`);
-  await log(guild, `🚨 **Anti-raid** — ${executor.tag} (${executor.id}) : ${reason}. Action : ${config.actions.onDestructiveRaid}.`);
+async function refreshBoard() {
+  try { await ensureMessage(config.absenceBoardChannelId, 'boardMessageId', { embeds: [boardEmbed()], allowedMentions: { parse: [] } }); }
+  catch (error) { console.error('Mise à jour du panneau des absences impossible :', error.message); }
 }
-async function guardEvent(guild, targetId, auditType, key, reason) {
-  if (!guild || guild.id !== guildId) return;
-  const exec = await auditExecutor(guild, auditType, targetId);
-  if (!exec || exempt(await guild.members.fetch(exec.id).catch(() => null))) return;
-  const cfg = limit(key); if (!cfg || record(`${guild.id}:${key}:${exec.id}`, cfg.windowMs) < cfg.count) return;
-  await counterGuard(guild, exec, key, reason);
+async function ensureRequestPanel() {
+  try { await ensureMessage(config.absenceRequestChannelId, 'requestPanelMessageId', { embeds: [createPanelEmbed()], components: [createPanelRow()] }); }
+  catch (error) { console.error('Panneau de demande d’absence impossible :', error.message); }
 }
-
+async function postReview(absence) {
+  const channel = await fetchTextChannel(config.absenceReviewChannelId);
+  let message = absence.reviewMessageId ? await channel.messages.fetch(absence.reviewMessageId).catch(() => null) : null;
+  const payload = { embeds: [formatReviewEmbed(absence)], components: [reviewButtons(absence)], allowedMentions: { users: [absence.userId], parse: [] } };
+  if (message) await message.edit(payload);
+  else {
+    message = await channel.send(payload);
+    absence.reviewMessageId = message.id;
+    saveState();
+  }
+}
+async function restorePendingReviews() {
+  for (const absence of state.absences.filter(a => a.status === 'pending')) {
+    try { await postReview(absence); }
+    catch (error) { console.error(`Restauration de la demande ${absence.id} impossible :`, error.message); }
+  }
+}
+async function submitAbsence(interaction) {
+  let startAt, endAt;
+  try {
+    startAt = toTimestamp(interaction.fields.getTextInputValue('start'));
+    endAt = toTimestamp(interaction.fields.getTextInputValue('end'));
+    if (endAt <= startAt) throw new Error('Le retour doit être après le départ.');
+    if (startAt < Date.now() - 60000) throw new Error('La date de départ ne peut pas être dans le passé.');
+  } catch (error) { return interaction.reply({ content: error.message, ephemeral: true }); }
+  const reason = interaction.fields.getTextInputValue('reason').trim();
+  if (!reason) return interaction.reply({ content: 'Le motif ne peut pas être vide.', ephemeral: true });
+  const absence = {
+    id: randomUUID(), userId: interaction.user.id,
+    reason, startAt, endAt,
+    status: 'pending', createdAt: Date.now(), reviewMessageId: null
+  };
+  state.absences.push(absence);
+  try { saveState(); await postReview(absence); }
+  catch (error) {
+    state.absences = state.absences.filter(a => a.id !== absence.id);
+    try { saveState(); } catch {}
+    console.error('Création de la demande impossible :', error);
+    return interaction.reply({ content: 'Impossible d’enregistrer/envoyer la demande. Préviens un administrateur.', ephemeral: true });
+  }
+  return interaction.reply({ content: 'Ta demande d’absence a été envoyée pour validation.', ephemeral: true });
+}
+async function decideAbsence(interaction, absence, decision, refusalReason = null) {
+  if (absence.status !== 'pending') return interaction.reply({ content: 'Cette demande a déjà été traitée.', ephemeral: true });
+  absence.status = decision;
+  absence.decidedBy = interaction.user.id;
+  absence.decidedAt = Date.now();
+  if (refusalReason) absence.decisionReason = refusalReason.trim();
+  try { saveState(); await postReview(absence); }
+  catch (error) {
+    absence.status = 'pending'; delete absence.decidedBy; delete absence.decidedAt; delete absence.decisionReason;
+    console.error('Mise à jour de la décision impossible :', error);
+    return interaction.reply({ content: 'La décision n’a pas pu être enregistrée. Réessaie.', ephemeral: true });
+  }
+  if (decision === 'rejected') {
+    const user = await client.users.fetch(absence.userId).catch(() => null);
+    if (user) await user.send({ embeds: [new EmbedBuilder().setColor(0xe74c3c).setTitle('Demande d’absence refusée')
+      .setDescription(`Ta demande du ${displayDate(absence.startAt)} au ${displayDate(absence.endAt)} a été refusée.\n**Motif :** ${safeText(refusalReason)}`)
+      .setFooter({ text: `Décision par ${interaction.user.tag}` }).setTimestamp()], allowedMentions: { parse: [] } }).catch(() => null);
+  }
+  await interaction.reply({ content: decision === 'approved' ? 'Absence acceptée.' : 'Absence refusée. Un message privé a été envoyé si la personne accepte les MP.', ephemeral: true });
+  if (decision === 'approved') await refreshBoard();
+}
 client.once('ready', async () => {
   try {
-    await client.application.commands.set([whitelistCommand.toJSON()], guildId);
-    console.log('Commandes /wl enregistrées sur le serveur configuré.');
-  } catch (error) { console.error('Impossible d’enregistrer /wl :', error.message); }
+    await client.application.commands.set([], guildId);
+    console.log('Commandes slash du serveur supprimées.');
+  } catch (error) { console.error('Réinitialisation des commandes slash du serveur impossible :', error.message); }
+  try {
+    await client.application.commands.set([]);
+    console.log('Commandes slash globales supprimées.');
+  } catch (error) { console.error('Réinitialisation des commandes slash globales impossible :', error.message); }
   console.log(`Connecté en tant que ${client.user.tag} — serveur ${guildId}`);
+  await ensureRequestPanel();
+  await refreshBoard();
+  await restorePendingReviews();
+  setInterval(refreshBoard, 60_000);
 });
-client.on('interactionCreate', interaction => handleWhitelistCommand(interaction).catch(error => {
-  console.error('Erreur dans la commande /wl :', error);
-  if (!interaction.replied && !interaction.deferred) interaction.reply({ content: 'Une erreur est survenue pendant la commande.', ephemeral: true }).catch(() => {});
-}));
-client.on('guildMemberAdd', async member => {
-  if (member.guild.id !== guildId) return;
-  const cfg = limit('joins');
-  if (record(`${guildId}:joins`, cfg.windowMs) >= cfg.count) {
-    await punish(member, config.actions.onRaidJoin, 0, 'Arrivées groupées détectées');
-    await log(member.guild, `🚨 Vague d'arrivées détectée (${cfg.count} en ${cfg.windowMs / 1000}s). ${member.user.tag} (${member.id}) traité.`);
-  }
-});
-client.on('messageCreate', async message => {
-  if (!message.guild || message.guild.id !== guildId || !message.member || exempt(message.member)) return;
-  if (config.spam.ignoredChannelIds.includes(message.channelId)) return;
-  const settings = limit('messages'); const key = `${message.guild.id}:${message.author.id}`; const now = Date.now();
-  const list = (userMessages.get(key) || []).filter(x => now - x.time < settings.windowMs);
-  list.push({ time: now, content: message.content.toLowerCase().trim(), id: message.id }); userMessages.set(key, list);
-  const repeated = list.filter(x => x.content && x.content === message.content.toLowerCase().trim()).length;
-  const tooManyFiles = message.attachments.size > config.spam.maxAttachments;
-  const spam = list.length >= settings.count || repeated >= limit('repeatedMessages').count || tooManyFiles;
-  if (!spam) {
-    if (list.length === config.spam.warnAt && !warned.has(key)) {
-      warned.set(key, now); await message.reply('⚠️ Ralentis le rythme de tes messages.').catch(() => {});
+client.on('interactionCreate', async interaction => {
+  try {
+    if (interaction.guildId !== guildId) return;
+    if (interaction.isButton() && interaction.customId === 'absence:create') {
+      if (interaction.channelId !== config.absenceRequestChannelId) return interaction.reply({ content: 'Utilise le panneau de demande configuré.', ephemeral: true });
+      return interaction.showModal(createRequestModal());
     }
-    return;
+    if (interaction.isModalSubmit() && interaction.customId === 'absence:submit') {
+      if (interaction.channelId !== config.absenceRequestChannelId) return interaction.reply({ content: 'Cette demande ne peut pas être envoyée depuis ce salon.', ephemeral: true });
+      return await submitAbsence(interaction);
+    }
+    if (interaction.isButton() && (interaction.customId.startsWith('absence:approve:') || interaction.customId.startsWith('absence:reject:'))) {
+      if (interaction.channelId !== config.absenceReviewChannelId) return interaction.reply({ content: 'Cette action est réservée au salon de validation configuré.', ephemeral: true });
+      const [, action, id] = interaction.customId.split(':');
+      const absence = state.absences.find(a => a.id === id);
+      if (!absence) return interaction.reply({ content: 'Demande introuvable.', ephemeral: true });
+      if (action === 'reject') {
+        const modal = new ModalBuilder().setCustomId(`absence:reject-reason:${id}`).setTitle('Motif du refus').addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Raison communiquée à la personne').setStyle(TextInputStyle.Paragraph).setMaxLength(800).setRequired(true))
+        );
+        return interaction.showModal(modal);
+      }
+      return await decideAbsence(interaction, absence, 'approved');
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('absence:reject-reason:')) {
+      if (interaction.channelId !== config.absenceReviewChannelId) return interaction.reply({ content: 'Cette action est réservée au salon de validation configuré.', ephemeral: true });
+      const id = interaction.customId.slice('absence:reject-reason:'.length);
+      const absence = state.absences.find(a => a.id === id);
+      if (!absence) return interaction.reply({ content: 'Demande introuvable.', ephemeral: true });
+      return await decideAbsence(interaction, absence, 'rejected', interaction.fields.getTextInputValue('reason'));
+    }
+  } catch (error) {
+    console.error('Erreur de traitement d’interaction :', error);
+    if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) await interaction.reply({ content: 'Une erreur est survenue. Réessaie ou contacte un administrateur.', ephemeral: true }).catch(() => {});
   }
-  if (config.spam.deleteMessages) await Promise.all(list.map(x => message.channel.messages.delete(x.id).catch(() => {})));
-  const duration = config.actions.spamTimeoutMs;
-  await punish(message.member, config.actions.onSpam, duration, 'Spam détecté');
-  await log(message.guild, `🛡️ Spam détecté : ${message.author.tag} (${message.author.id}) dans <#${message.channelId}>. ${list.length} messages en ${settings.windowMs / 1000}s.`);
-  userMessages.delete(key); warned.delete(key);
 });
-client.on('channelDelete', ch => guardEvent(ch.guild, ch.id, AuditLogEvent.ChannelDelete, 'channelDeletes', 'suppressions massives de salons'));
-client.on('channelCreate', ch => guardEvent(ch.guild, ch.id, AuditLogEvent.ChannelCreate, 'channelCreates', 'créations massives de salons'));
-client.on('roleDelete', role => guardEvent(role.guild, role.id, AuditLogEvent.RoleDelete, 'roleDeletes', 'suppressions massives de rôles'));
-client.on('roleCreate', role => guardEvent(role.guild, role.id, AuditLogEvent.RoleCreate, 'roleCreates', 'créations massives de rôles'));
-client.on('guildBanAdd', ban => guardEvent(ban.guild, ban.user.id, AuditLogEvent.MemberBanAdd, 'bans', 'bannissements massifs'));
-client.on('guildMemberRemove', async member => {
-  if (member.guild.id !== guildId) return;
-  const exec = await auditExecutor(member.guild, AuditLogEvent.MemberKick, member.id);
-  if (!exec) return;
-  const cfg = limit('kicks'); if (record(`${guildId}:kicks:${exec.id}`, cfg.windowMs) >= cfg.count) await counterGuard(member.guild, exec, 'kicks', 'expulsions massives');
-});
-client.on('guildMemberUpdate', async (oldM, newM) => {
-  if (newM.guild.id !== guildId || oldM.communicationDisabledUntilTimestamp === newM.communicationDisabledUntilTimestamp || !newM.communicationDisabledUntilTimestamp) return;
-  const exec = await auditExecutor(newM.guild, AuditLogEvent.MemberUpdate, newM.id);
-  if (!exec) return;
-  const cfg = limit('timeouts'); if (record(`${guildId}:timeouts:${exec.id}`, cfg.windowMs) >= cfg.count) await counterGuard(newM.guild, exec, 'timeouts', 'timeouts massifs');
-});
-client.on('error', e => console.error('Discord client error:', e));
-process.on('unhandledRejection', e => console.error('Erreur asynchrone:', e));
+client.on('error', error => console.error('Discord client error:', error));
+process.on('unhandledRejection', error => console.error('Erreur asynchrone:', error));
 client.login(config.token);

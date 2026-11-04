@@ -1,7 +1,7 @@
 node_modules/
 config.local.json
-whitelist.json
-whitelist.json.tmp
+absences.json
+absences.json.tmp
 .env
 *.log
 google_drive/

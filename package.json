@@ -1,8 +1,8 @@
 {
-  "name": "madrid-rp-antiraid",
+  "name": "madrid-rp-absences",
   "version": "1.0.0",
   "private": true,
-  "description": "Bot anti-raid Discord mono-serveur",
+  "description": "Gestion des absences Discord pour un serveur",
   "main": "index.js",
   "scripts": { "start": "node index.js" },
   "dependencies": { "discord.js": "^14.14.1" }
