@@ -1,7 +1,6 @@
 node_modules/
 config.local.json
-absences.json
-absences.json.tmp
+absences.json*
 .env
 *.log
 google_drive/

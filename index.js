@@ -22,24 +22,49 @@ const dateFormatter = new Intl.DateTimeFormat('fr-FR', {
 });
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
+function emptyState() { return { boardMessageId: null, requestPanelMessageId: null, absences: [] }; }
+function isSnowflake(value) { return typeof value === 'string' && /^\d{17,20}$/.test(value); }
 function loadState() {
-  try {
-    const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
-    return {
-      boardMessageId: state.boardMessageId || null,
-      requestPanelMessageId: state.requestPanelMessageId || null,
-      absences: Array.isArray(state.absences) ? state.absences : []
-    };
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw new Error(`Impossible de lire ${statePath}: ${error.message}`);
-    return { boardMessageId: null, requestPanelMessageId: null, absences: [] };
+  let parsed;
+  try { parsed = JSON.parse(fs.readFileSync(statePath, 'utf8')); }
+  catch (error) {
+    if (error.code === 'ENOENT') return emptyState();
+    const backupPath = `${statePath}.corrupt-${Date.now()}`;
+    try { fs.renameSync(statePath, backupPath); } catch {}
+    console.error(`Le fichier d’absences est illisible; copie de secours: ${backupPath}`, error.message);
+    return emptyState();
   }
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.absences)) {
+    const backupPath = `${statePath}.corrupt-${Date.now()}`;
+    try { fs.renameSync(statePath, backupPath); } catch {}
+    console.error(`Format de ${statePath} invalide; fichier sauvegardé sous ${backupPath}.`);
+    return emptyState();
+  }
+  const absences = parsed.absences.filter(a => a && typeof a === 'object' && typeof a.id === 'string' &&
+    isSnowflake(a.userId) && typeof a.reason === 'string' && Number.isFinite(a.startAt) && Number.isFinite(a.endAt) &&
+    a.endAt > a.startAt && ['pending', 'approved', 'rejected'].includes(a.status));
+  if (absences.length !== parsed.absences.length) console.warn('Certaines entrées invalides de absences.json ont été ignorées.');
+  return {
+    boardMessageId: isSnowflake(parsed.boardMessageId) ? parsed.boardMessageId : null,
+    requestPanelMessageId: isSnowflake(parsed.requestPanelMessageId) ? parsed.requestPanelMessageId : null,
+    absences
+  };
 }
 const state = loadState();
 function saveState() {
   const tmp = `${statePath}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-  fs.renameSync(tmp, statePath);
+  let fd;
+  try {
+    fd = fs.openSync(tmp, 'w', 0o600);
+    fs.writeFileSync(fd, `${JSON.stringify(state, null, 2)}\n`);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd); fd = undefined;
+    fs.renameSync(tmp, statePath);
+  } catch (error) {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+    try { fs.unlinkSync(tmp); } catch {}
+    throw error;
+  }
 }
 function dateParts(timestamp) {
   return Object.fromEntries(dateFormatter.formatToParts(new Date(timestamp)).filter(p => p.type !== 'literal').map(p => [p.type, Number(p.value)]));
@@ -104,7 +129,7 @@ function boardEmbed() {
 }
 async function fetchTextChannel(id) {
   const channel = await client.channels.fetch(id).catch(() => null);
-  if (!channel?.isTextBased() || !channel.messages) throw new Error(`Le salon ${id} est introuvable ou n’est pas un salon textuel accessible.`);
+  if (!channel?.isTextBased() || !channel.messages || channel.guildId !== guildId) throw new Error(`Le salon ${id} est introuvable, inaccessible ou n’appartient pas au serveur configuré.`);
   return channel;
 }
 async function ensureMessage(channelId, stateKey, payload) {
@@ -122,9 +147,13 @@ async function ensureMessage(channelId, stateKey, payload) {
   saveState();
   return message;
 }
+let boardRefreshRunning = false;
 async function refreshBoard() {
+  if (boardRefreshRunning) return;
+  boardRefreshRunning = true;
   try { await ensureMessage(config.absenceBoardChannelId, 'boardMessageId', { embeds: [boardEmbed()], allowedMentions: { parse: [] } }); }
   catch (error) { console.error('Mise à jour du panneau des absences impossible :', error.message); }
+  finally { boardRefreshRunning = false; }
 }
 async function ensureRequestPanel() {
   try { await ensureMessage(config.absenceRequestChannelId, 'requestPanelMessageId', { embeds: [createPanelEmbed()], components: [createPanelRow()] }); }
@@ -153,7 +182,6 @@ async function submitAbsence(interaction) {
     startAt = toTimestamp(interaction.fields.getTextInputValue('start'));
     endAt = toTimestamp(interaction.fields.getTextInputValue('end'));
     if (endAt <= startAt) throw new Error('Le retour doit être après le départ.');
-    if (startAt < Date.now() - 60000) throw new Error('La date de départ ne peut pas être dans le passé.');
   } catch (error) { return interaction.reply({ content: error.message, ephemeral: true }); }
   const reason = interaction.fields.getTextInputValue('reason').trim();
   if (!reason) return interaction.reply({ content: 'Le motif ne peut pas être vide.', ephemeral: true });
@@ -162,35 +190,42 @@ async function submitAbsence(interaction) {
     reason, startAt, endAt,
     status: 'pending', createdAt: Date.now(), reviewMessageId: null
   };
+  await interaction.deferReply({ ephemeral: true });
   state.absences.push(absence);
-  try { saveState(); await postReview(absence); }
-  catch (error) {
+  try {
+    saveState();
+    await postReview(absence);
+  } catch (error) {
     state.absences = state.absences.filter(a => a.id !== absence.id);
-    try { saveState(); } catch {}
+    try { saveState(); } catch (saveError) { console.error('Rollback de demande impossible :', saveError); }
     console.error('Création de la demande impossible :', error);
-    return interaction.reply({ content: 'Impossible d’enregistrer/envoyer la demande. Préviens un administrateur.', ephemeral: true });
+    return interaction.editReply('Impossible d’enregistrer/envoyer la demande. Préviens un administrateur.');
   }
-  return interaction.reply({ content: 'Ta demande d’absence a été envoyée pour validation.', ephemeral: true });
+  return interaction.editReply('Ta demande d’absence a été envoyée pour validation.');
 }
 async function decideAbsence(interaction, absence, decision, refusalReason = null) {
   if (absence.status !== 'pending') return interaction.reply({ content: 'Cette demande a déjà été traitée.', ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
+  const previous = { status: absence.status, decidedBy: absence.decidedBy, decidedAt: absence.decidedAt, decisionReason: absence.decisionReason };
   absence.status = decision;
   absence.decidedBy = interaction.user.id;
   absence.decidedAt = Date.now();
   if (refusalReason) absence.decisionReason = refusalReason.trim();
-  try { saveState(); await postReview(absence); }
+  try { saveState(); }
   catch (error) {
-    absence.status = 'pending'; delete absence.decidedBy; delete absence.decidedAt; delete absence.decisionReason;
-    console.error('Mise à jour de la décision impossible :', error);
-    return interaction.reply({ content: 'La décision n’a pas pu être enregistrée. Réessaie.', ephemeral: true });
+    Object.assign(absence, previous);
+    console.error('Enregistrement de la décision impossible :', error);
+    return interaction.editReply('La décision n’a pas pu être enregistrée. Réessaie.');
   }
+  try { await postReview(absence); }
+  catch (error) { console.error('La décision est enregistrée, mais le message de validation n’a pas pu être actualisé :', error); }
   if (decision === 'rejected') {
     const user = await client.users.fetch(absence.userId).catch(() => null);
     if (user) await user.send({ embeds: [new EmbedBuilder().setColor(0xe74c3c).setTitle('Demande d’absence refusée')
       .setDescription(`Ta demande du ${displayDate(absence.startAt)} au ${displayDate(absence.endAt)} a été refusée.\n**Motif :** ${safeText(refusalReason)}`)
       .setFooter({ text: `Décision par ${interaction.user.tag}` }).setTimestamp()], allowedMentions: { parse: [] } }).catch(() => null);
   }
-  await interaction.reply({ content: decision === 'approved' ? 'Absence acceptée.' : 'Absence refusée. Un message privé a été envoyé si la personne accepte les MP.', ephemeral: true });
+  await interaction.editReply(decision === 'approved' ? 'Absence acceptée.' : 'Absence refusée. Un message privé a été envoyé si la personne accepte les MP.');
   if (decision === 'approved') await refreshBoard();
 }
 client.once('ready', async () => {
@@ -237,7 +272,9 @@ client.on('interactionCreate', async interaction => {
       const id = interaction.customId.slice('absence:reject-reason:'.length);
       const absence = state.absences.find(a => a.id === id);
       if (!absence) return interaction.reply({ content: 'Demande introuvable.', ephemeral: true });
-      return await decideAbsence(interaction, absence, 'rejected', interaction.fields.getTextInputValue('reason'));
+      const refusalReason = interaction.fields.getTextInputValue('reason').trim();
+      if (!refusalReason) return interaction.reply({ content: 'Le motif du refus ne peut pas être vide.', ephemeral: true });
+      return await decideAbsence(interaction, absence, 'rejected', refusalReason);
     }
   } catch (error) {
     console.error('Erreur de traitement d’interaction :', error);

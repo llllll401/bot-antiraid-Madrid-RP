@@ -18,7 +18,7 @@ Au démarrage, le bot supprime les anciennes commandes slash enregistrées pour 
 - `absenceReviewChannelId` : demandes avec boutons Accepter/Refuser. Le refus ouvre un formulaire de motif ; le bot envoie ce motif en MP à la personne ayant fait la demande.
 - `timezone` : fuseau des heures entrées et affichées, par défaut `Europe/Paris`.
 
-Entrer les dates au format `JJ/MM/AAAA HH:MM`, par exemple `05/11/2026 14:30`. Le bot vérifie le format, la validité des dates, que le retour suit le départ et que le départ n’est pas passé. Les horaires inexistants lors du changement d’heure sont refusés.
+Entrer les dates au format `JJ/MM/AAAA HH:MM`, par exemple `05/11/2026 14:30`. Le bot vérifie le format, la validité des dates et que le retour suit le départ. La date de départ peut être dans le passé (par exemple, pour déclarer une absence déjà commencée). Les horaires inexistants lors du changement d’heure sont refusés.
 
 ## Stockage et panneaux
 
