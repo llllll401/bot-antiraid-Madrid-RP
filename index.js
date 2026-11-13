@@ -1,6 +1,7 @@
 const {
   ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, EmbedBuilder, GatewayIntentBits,
-  ModalBuilder, TextInputBuilder, TextInputStyle
+  ModalBuilder, TextInputBuilder, TextInputStyle, UserSelectMenuBuilder,
+  RoleSelectMenuBuilder, StringSelectMenuBuilder, StringSelectMenuOptionBuilder
 } = require('discord.js');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -10,8 +11,16 @@ const configPath = path.join(__dirname, 'config.json');
 const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 if (!config.token || /^(COLLER_|REMPLACER_|YOUR_)/i.test(config.token)) throw new Error('Renseignez le vrai token dans config.json');
 if (!/^\d{17,20}$/.test(config.guildId || '')) throw new Error('Renseignez un guildId Discord valide dans config.json');
-for (const field of ['absenceBoardChannelId', 'absenceRequestChannelId', 'absenceReviewChannelId']) {
+for (const field of ['absenceBoardChannelId', 'absenceRequestChannelId', 'absenceReviewChannelId', 'sanctionPanelChannelId', 'sanctionLogChannelId']) {
   if (!/^\d{17,20}$/.test(config[field] || '')) throw new Error(`Renseignez ${field} dans config.json`);
+}
+for (const key of ['warn1', 'warn2', 'suspension3Days']) {
+  if (!/^\d{17,20}$/.test(config.sanctionRoles?.[key] || '')) throw new Error(`Renseignez sanctionRoles.${key} dans config.json`);
+}
+if (new Set(Object.values(config.sanctionRoles)).size !== 3) throw new Error('Chaque sanction doit avoir un ID de rôle différent.');
+const sanctionDurations = config.sanctionDurationsDays || { warn1: 7, warn2: 7, suspension3Days: 3 };
+for (const key of ['warn1', 'warn2', 'suspension3Days']) {
+  if (!Number.isFinite(sanctionDurations[key]) || sanctionDurations[key] <= 0 || sanctionDurations[key] > 3650) throw new Error(`Durée invalide pour ${key} dans config.json`);
 }
 const guildId = config.guildId;
 const statePath = path.join(__dirname, 'absences.json');
@@ -20,9 +29,9 @@ const dateFormatter = new Intl.DateTimeFormat('fr-FR', {
   timeZone: timezone, day: '2-digit', month: '2-digit', year: 'numeric',
   hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
 });
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
 
-function emptyState() { return { boardMessageId: null, requestPanelMessageId: null, absences: [] }; }
+function emptyState() { return { boardMessageId: null, requestPanelMessageId: null, sanctionPanelMessageId: null, absences: [], sanctions: [] }; }
 function isSnowflake(value) { return typeof value === 'string' && /^\d{17,20}$/.test(value); }
 function loadState() {
   let parsed;
@@ -43,11 +52,17 @@ function loadState() {
   const absences = parsed.absences.filter(a => a && typeof a === 'object' && typeof a.id === 'string' &&
     isSnowflake(a.userId) && typeof a.reason === 'string' && Number.isFinite(a.startAt) && Number.isFinite(a.endAt) &&
     a.endAt > a.startAt && ['pending', 'approved', 'rejected'].includes(a.status));
-  if (absences.length !== parsed.absences.length) console.warn('Certaines entrées invalides de absences.json ont été ignorées.');
+  const rawSanctions = Array.isArray(parsed.sanctions) ? parsed.sanctions : [];
+  const sanctions = rawSanctions.filter(s => s && typeof s === 'object' && typeof s.id === 'string' &&
+    isSnowflake(s.userId) && isSnowflake(s.moderatorId) && typeof s.reason === 'string' &&
+    ['warn1', 'warn2', 'suspension3Days'].includes(s.type) && ['active', 'expired', 'cleared', 'failed'].includes(s.status) &&
+    Number.isFinite(s.issuedAt) && Number.isFinite(s.expiresAt) && s.expiresAt > s.issuedAt);
+  if (absences.length !== parsed.absences.length || sanctions.length !== rawSanctions.length) console.warn('Certaines entrées invalides de absences.json ont été ignorées.');
   return {
     boardMessageId: isSnowflake(parsed.boardMessageId) ? parsed.boardMessageId : null,
     requestPanelMessageId: isSnowflake(parsed.requestPanelMessageId) ? parsed.requestPanelMessageId : null,
-    absences
+    sanctionPanelMessageId: isSnowflake(parsed.sanctionPanelMessageId) ? parsed.sanctionPanelMessageId : null,
+    absences, sanctions
   };
 }
 const state = loadState();
@@ -228,6 +243,309 @@ async function decideAbsence(interaction, absence, decision, refusalReason = nul
   await interaction.editReply(decision === 'approved' ? 'Absence acceptée.' : 'Absence refusée. Un message privé a été envoyé si la personne accepte les MP.');
   if (decision === 'approved') await refreshBoard();
 }
+
+const wizardByMessage = new Map();
+const wizardByNonce = new Map();
+const DAY_MS = 86_400_000;
+const tierNames = { warn1: 'Warn 1', warn2: 'Warn 2', suspension3Days: 'Mise à pied — 3 jours' };
+const tierRoleId = type => config.sanctionRoles[type];
+const tierDurationMs = type => sanctionDurations[type] * DAY_MS;
+const activeFor = (userId, type, now = Date.now()) => state.sanctions.filter(s => s.userId === userId && s.type === type && s.status === 'active' && s.expiresAt > now);
+function sanctionPanelEmbed() {
+  return new EmbedBuilder().setColor(0xc0392b).setTitle('Panneau des sanctions')
+    .setDescription('Clique sur le bouton pour choisir une personne et une sanction disponible. Ensuite, saisis le motif dans le modal, puis sélectionne jusqu’à cinq rôles à mentionner dans le journal.')
+    .setFooter({ text: 'Les rôles de sanction expirent automatiquement, y compris après un redémarrage.' });
+}
+function sanctionPanelRow() {
+  return new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('sanction:open').setLabel('Créer une sanction').setStyle(ButtonStyle.Danger));
+}
+function sanctionWorkflowDescription(w) {
+  return `**Personne :** ${w.targetUserId ? `<@${w.targetUserId}>` : 'à choisir'}\n**Sanction :** ${w.type ? tierNames[w.type] : 'à choisir'}\n**Rôles à mentionner :** ${w.mentionRoleIds.length ? w.mentionRoleIds.map(id => `<@&${id}>`).join(' ') : 'aucun'}`;
+}
+function eligibleTiers(member) {
+  if (!member) return [];
+  const now = Date.now();
+  if (state.sanctions.some(s => s.userId === member.id && s.type === 'suspension3Days' && s.status === 'active')) return [];
+  const hasWarn1 = member.roles.cache.has(tierRoleId('warn1')) && activeFor(member.id, 'warn1', now).length > 0;
+  const hasWarn2 = member.roles.cache.has(tierRoleId('warn2')) && activeFor(member.id, 'warn2', now).length > 0;
+  return ['warn1', ...(hasWarn1 ? ['warn2'] : []), ...(hasWarn1 && hasWarn2 ? ['suspension3Days'] : [])];
+}
+function wizardComponents(w) {
+  const userSelect = new UserSelectMenuBuilder().setCustomId('sanction:target').setPlaceholder('1. Choisir la personne').setMinValues(1).setMaxValues(1);
+  if (w.targetUserId) userSelect.setDefaultUsers(w.targetUserId);
+  const tierOptions = w.allowedTiers?.length
+    ? w.allowedTiers.map(type => new StringSelectMenuOptionBuilder().setLabel(tierNames[type]).setValue(type).setDefault(w.type === type))
+    : [new StringSelectMenuOptionBuilder().setLabel('Aucune sanction disponible').setValue('none')];
+  const tierSelect = new StringSelectMenuBuilder().setCustomId('sanction:tier').setPlaceholder('2. Choisir une sanction disponible').setMinValues(1).setMaxValues(1).addOptions(tierOptions);
+  return [
+    new ActionRowBuilder().addComponents(userSelect),
+    new ActionRowBuilder().addComponents(tierSelect),
+    new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('sanction:continue').setLabel('Continuer vers le motif').setStyle(ButtonStyle.Primary).setDisabled(!w.targetUserId || !w.type))
+  ];
+}
+function sanctionMentionComponents(w) {
+  const roles = new RoleSelectMenuBuilder().setCustomId('sanction:mentions').setPlaceholder('Sélectionner jusqu’à 5 rôles à mentionner').setMinValues(0).setMaxValues(5);
+  if (w.mentionRoleIds.length) roles.setDefaultRoles(w.mentionRoleIds);
+  return [
+    new ActionRowBuilder().addComponents(roles),
+    new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('sanction:apply').setLabel('Appliquer la sanction').setStyle(ButtonStyle.Danger))
+  ];
+}
+function workflowFrom(interaction) {
+  const w = wizardByMessage.get(interaction.message?.id);
+  return w && w.ownerId === interaction.user.id && interaction.channelId === config.sanctionPanelChannelId ? w : null;
+}
+async function openSanctionWizard(interaction) {
+  const w = { ownerId: interaction.user.id, guildId, targetUserId: null, type: null, allowedTiers: ['warn1'], mentionRoleIds: [] };
+  const message = await interaction.reply({ content: sanctionWorkflowDescription(w), components: wizardComponents(w), ephemeral: true, fetchReply: true, allowedMentions: { parse: [] } });
+  wizardByMessage.set(message.id, w);
+  const timer = setTimeout(() => wizardByMessage.delete(message.id), 15 * 60_000); timer.unref?.();
+}
+async function refreshWizard(interaction, w) {
+  const content = `${sanctionWorkflowDescription(w)}${w.reason ? `\n**Motif :** ${safeText(w.reason, 300)}` : ''}`;
+  const payload = { content, components: w.reason ? sanctionMentionComponents(w) : wizardComponents(w), allowedMentions: { parse: [] } };
+  if (interaction.deferred) await interaction.editReply(payload);
+  else await interaction.update(payload);
+}
+function createSanctionReasonModal(nonce) {
+  return new ModalBuilder().setCustomId(`sanction:reason:${nonce}`).setTitle('Motif de la sanction').addComponents(
+    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Motif détaillé').setStyle(TextInputStyle.Paragraph).setMaxLength(800).setRequired(true))
+  );
+}
+async function handleSanctionInteraction(interaction) {
+  if (interaction.isButton() && interaction.customId === 'sanction:open') {
+    if (interaction.guildId !== guildId || interaction.channelId !== config.sanctionPanelChannelId) {
+      await interaction.reply({ content: 'Utilise le panneau du salon de sanctions configuré.', ephemeral: true }); return true;
+    }
+    await openSanctionWizard(interaction); return true;
+  }
+  if (interaction.isUserSelectMenu() && interaction.customId === 'sanction:target') {
+    const w = workflowFrom(interaction); if (!w) { await interaction.reply({ content: 'Ce formulaire a expiré ou ne t’appartient pas.', ephemeral: true }); return true; }
+    await interaction.deferUpdate();
+    const member = await interaction.guild.members.fetch({ user: interaction.values[0], force: true }).catch(() => null);
+    if (!member) { await interaction.editReply({ content: 'Cette personne n’est plus membre du serveur.', components: wizardComponents(w) }); return true; }
+    w.targetUserId = member.id; w.allowedTiers = eligibleTiers(member);
+    if (!w.allowedTiers.includes(w.type)) w.type = null;
+    await refreshWizard(interaction, w); return true;
+  }
+  if (interaction.isStringSelectMenu() && interaction.customId === 'sanction:tier') {
+    const w = workflowFrom(interaction); if (!w) { await interaction.reply({ content: 'Ce formulaire a expiré ou ne t’appartient pas.', ephemeral: true }); return true; }
+    await interaction.deferUpdate();
+    const member = w.targetUserId ? await interaction.guild.members.fetch({ user: w.targetUserId, force: true }).catch(() => null) : null;
+    w.allowedTiers = eligibleTiers(member);
+    if (!w.allowedTiers.includes(interaction.values[0])) {
+      w.type = null; await interaction.editReply({ content: `${sanctionWorkflowDescription(w)}\n⚠️ Cette sanction n’est pas disponible : la séquence de rôles requise n’est pas active.`, components: wizardComponents(w), allowedMentions: { parse: [] } }); return true;
+    }
+    w.type = interaction.values[0]; await refreshWizard(interaction, w); return true;
+  }
+  if (interaction.isRoleSelectMenu() && interaction.customId === 'sanction:mentions') {
+    const w = workflowFrom(interaction); if (!w) { await interaction.reply({ content: 'Ce formulaire a expiré ou ne t’appartient pas.', ephemeral: true }); return true; }
+    w.mentionRoleIds = interaction.values.slice(0, 5); await refreshWizard(interaction, w); return true;
+  }
+  if (interaction.isButton() && interaction.customId === 'sanction:apply') {
+    const w = workflowFrom(interaction);
+    if (!w || !w.reason) { await interaction.reply({ content: 'Ce formulaire a expiré ou ne t’appartient pas.', ephemeral: true }); return true; }
+    wizardByMessage.delete(interaction.message.id);
+    await interaction.deferReply({ ephemeral: true });
+    await issueSanction(interaction, w, w.reason); return true;
+  }
+  if (interaction.isButton() && interaction.customId === 'sanction:continue') {
+    const w = workflowFrom(interaction); if (!w) { await interaction.reply({ content: 'Ce formulaire a expiré ou ne t’appartient pas.', ephemeral: true }); return true; }
+    if (!w.targetUserId || !w.type || !w.allowedTiers.includes(w.type)) {
+      if (!w.allowedTiers.includes(w.type)) w.type = null;
+      await interaction.update({ content: `${sanctionWorkflowDescription(w)}\n⚠️ Sélectionne une sanction autorisée pour la personne.`, components: wizardComponents(w), allowedMentions: { parse: [] } }); return true;
+    }
+    const nonce = randomUUID(); wizardByNonce.set(nonce, w); wizardByMessage.delete(interaction.message.id);
+    const timer = setTimeout(() => wizardByNonce.delete(nonce), 15 * 60_000); timer.unref?.();
+    await interaction.showModal(createSanctionReasonModal(nonce)); return true;
+  }
+  if (interaction.isModalSubmit() && interaction.customId.startsWith('sanction:reason:')) {
+    const nonce = interaction.customId.slice('sanction:reason:'.length); const w = wizardByNonce.get(nonce);
+    if (!w || w.ownerId !== interaction.user.id || interaction.guildId !== guildId || interaction.channelId !== config.sanctionPanelChannelId) {
+      await interaction.reply({ content: 'Ce formulaire a expiré ou ne t’appartient pas.', ephemeral: true }); return true;
+    }
+    wizardByNonce.delete(nonce);
+    const reason = interaction.fields.getTextInputValue('reason').trim();
+    if (!reason) { await interaction.reply({ content: 'Le motif ne peut pas être vide.', ephemeral: true }); return true; }
+    w.reason = reason;
+    const message = await interaction.reply({ content: `${sanctionWorkflowDescription(w)}\n**Motif :** ${safeText(reason, 300)}\nChoisis jusqu’à cinq rôles à mentionner dans le journal, puis valide.`, components: sanctionMentionComponents(w), ephemeral: true, fetchReply: true, allowedMentions: { parse: [] } });
+    wizardByMessage.set(message.id, w);
+    const timer = setTimeout(() => wizardByMessage.delete(message.id), 15 * 60_000); timer.unref?.();
+    return true;
+  }
+  return false;
+}
+const sanctionIssueInFlight = new Set();
+async function issueSanction(interaction, w, reason) {
+  const key = `${w.targetUserId}:${w.type}`;
+  if (sanctionIssueInFlight.has(key)) return interaction.editReply('Une sanction de ce niveau est déjà en cours de traitement.');
+  sanctionIssueInFlight.add(key);
+  try { return await applySanction(interaction, w, reason); }
+  finally { sanctionIssueInFlight.delete(key); }
+}
+async function applySanction(interaction, w, reason) {
+  const guild = interaction.guild;
+  const member = await guild.members.fetch({ user: w.targetUserId, force: true }).catch(() => null);
+  const allowed = eligibleTiers(member);
+  if (!member || !allowed.includes(w.type)) return interaction.editReply('Impossible : la personne ou les rôles requis ne sont plus présents.');
+  if (state.sanctions.some(s => s.userId === member.id && s.type === w.type && s.status === 'active' && !s.roleApplied)) {
+    return interaction.editReply('Une sanction de ce niveau est déjà en cours d’application pour cette personne.');
+  }
+  let expiresAt = Date.now() + tierDurationMs(w.type);
+  let parentWarn1Id = null;
+  if (w.type === 'warn2') {
+    const priorWarn1 = activeFor(member.id, 'warn1').sort((a, b) => b.expiresAt - a.expiresAt)[0];
+    if (!priorWarn1 || !member.roles.cache.has(tierRoleId('warn1'))) return interaction.editReply('Warn 2 exige un Warn 1 encore actif.');
+    parentWarn1Id = priorWarn1.id; expiresAt = priorWarn1.expiresAt + tierDurationMs('warn2');
+  }
+  if (w.type === 'suspension3Days') {
+    if (!activeFor(member.id, 'warn1').length || !activeFor(member.id, 'warn2').length) return interaction.editReply('La mise à pied exige Warn 1 et Warn 2 encore actifs.');
+    expiresAt = Date.now() + tierDurationMs('suspension3Days');
+  }
+  const sanction = {
+    id: randomUUID(), userId: member.id, moderatorId: interaction.user.id, type: w.type, reason,
+    mentionRoleIds: w.mentionRoleIds.slice(0, 5), issuedAt: Date.now(), expiresAt, status: 'active',
+    parentWarn1Id, roleApplied: false, createdLogPending: true, expiryLogPending: false
+  };
+  state.sanctions.push(sanction);
+  try { saveState(); }
+  catch (error) { state.sanctions = state.sanctions.filter(s => s.id !== sanction.id); console.error('Sauvegarde de sanction impossible:', error); return interaction.editReply('La sanction n’a pas pu être enregistrée. Rien n’a été appliqué.'); }
+  try {
+    await member.roles.add(tierRoleId(w.type), `Sanction ${tierNames[w.type]} par ${interaction.user.tag}: ${reason.slice(0, 300)}`);
+  } catch (error) {
+    console.error('Attribution immédiate du rôle impossible; la sanction persistée sera retentée automatiquement:', error);
+    return interaction.editReply('La sanction est sauvegardée et le bot réessaiera automatiquement d’attribuer le rôle. Vérifie aussi sa permission Gérer les rôles et la hiérarchie des rôles.');
+  }
+  sanction.roleApplied = true;
+  try { saveState(); } catch (error) { console.error('Le rôle a été appliqué mais son état n’a pas pu être réécrit; il sera vérifié au prochain cycle.', error); }
+  await flushSanctionLogs();
+  return interaction.editReply(`${tierNames[w.type]} appliqué à <@${member.id}> jusqu’au ${displayDate(expiresAt)}.`);
+}
+function sanctionLogEmbed(sanction, expired = false, cleared = false) {
+  const title = expired ? `Sanction expirée — ${tierNames[sanction.type]}` : cleared ? 'Sanction retirée — fin de mise à pied' : `Sanction appliquée — ${tierNames[sanction.type]}`;
+  const dateLabel = expired ? 'Expirée le' : cleared ? 'Retirée le' : 'Expire le';
+  const eventTime = expired ? sanction.expiresAt : cleared ? (sanction.clearedAt || Date.now()) : sanction.issuedAt;
+  return new EmbedBuilder().setColor(expired || cleared ? 0x95a5a6 : 0xe74c3c).setTitle(title)
+    .setDescription(`**Personne :** <@${sanction.userId}>\n**Membre du staff :** <@${sanction.moderatorId}>\n**Motif :** ${safeText(sanction.reason, 800)}\n**${dateLabel} :** ${displayDate(expired || cleared ? eventTime : sanction.expiresAt)}${sanction.type === 'suspension3Days' && (expired || cleared) ? '\nLes rôles Warn 1 et Warn 2 ont aussi été retirés.' : ''}`)
+    .setFooter({ text: `Sanction ${sanction.id}` }).setTimestamp(eventTime);
+}
+async function sendSanctionLog(sanction, mode) {
+  const channel = await fetchTextChannel(config.sanctionLogChannelId);
+  const content = mode === 'created' && sanction.mentionRoleIds?.length ? sanction.mentionRoleIds.map(id => `<@&${id}>`).join(' ') : undefined;
+  await channel.send({ content, embeds: [sanctionLogEmbed(sanction, mode === 'expired', mode === 'cleared')], allowedMentions: { parse: [], roles: mode === 'created' ? sanction.mentionRoleIds || [] : [] } });
+}
+let sanctionLogFlushRunning = false;
+async function flushSanctionLogs() {
+  if (sanctionLogFlushRunning) return;
+  sanctionLogFlushRunning = true;
+  try {
+  for (const sanction of state.sanctions) {
+    if (sanction.createdLogPending && sanction.roleApplied) {
+      try { await sendSanctionLog(sanction, 'created'); sanction.createdLogPending = false; saveState(); }
+      catch (error) { console.error(`Journal de sanction ${sanction.id} indisponible (réessai automatique):`, error.message); }
+    }
+    if (sanction.expiryLogPending && sanction.expiryRolesSynced) {
+      try { await sendSanctionLog(sanction, sanction.status === 'cleared' ? 'cleared' : 'expired'); sanction.expiryLogPending = false; saveState(); }
+      catch (error) { console.error(`Journal d’expiration ${sanction.id} indisponible (réessai automatique):`, error.message); }
+    }
+  }
+  } finally { sanctionLogFlushRunning = false; }
+}
+let sanctionReconcileRunning = false;
+async function reconcileSanctions() {
+  if (sanctionReconcileRunning) return;
+  sanctionReconcileRunning = true;
+  try {
+  const now = Date.now(); let changed = false;
+  const users = [...new Set(state.sanctions.filter(s => s.status === 'active').map(s => s.userId))];
+  for (const userId of users) {
+    const suspensions = state.sanctions.filter(s => s.userId === userId && s.type === 'suspension3Days' && s.status === 'active');
+    if (suspensions.length) {
+      const pending = suspensions.filter(s => s.expiresAt <= now);
+      if (pending.length === suspensions.length) {
+        for (const suspension of pending) {
+          suspension.status = 'expired'; suspension.expiryLogPending = true; suspension.expiryRolesSynced = false;
+          if (!suspension.roleApplied) suspension.createdLogPending = false;
+        }
+        for (const warning of state.sanctions.filter(s => s.userId === userId && ['warn1', 'warn2'].includes(s.type) && s.status === 'active')) {
+          warning.status = 'cleared'; warning.expiryLogPending = true; warning.expiryRolesSynced = false; warning.clearedAt = now;
+        }
+        changed = true;
+      }
+    } else {
+      for (const sanction of state.sanctions.filter(s => s.userId === userId && ['warn1', 'warn2'].includes(s.type) && s.status === 'active' && s.expiresAt <= now)) {
+        sanction.status = 'expired'; sanction.expiryLogPending = true; sanction.expiryRolesSynced = false;
+        if (!sanction.roleApplied) sanction.createdLogPending = false;
+        changed = true;
+      }
+    }
+  }
+  if (changed) saveState();
+  const affectedUsers = [...new Set(state.sanctions.filter(s => s.status === 'active' || (s.expiryLogPending && !s.expiryRolesSynced)).map(s => s.userId))];
+  for (const userId of affectedUsers) {
+    const member = await client.guilds.cache.get(guildId)?.members.fetch({ user: userId, force: true }).catch(() => null);
+    if (!member) {
+      for (const sanction of state.sanctions.filter(s => s.userId === userId && s.expiryLogPending && !s.expiryRolesSynced)) {
+        sanction.expiryRolesSynced = true; changed = true;
+      }
+      continue;
+    }
+    const active = state.sanctions.filter(s => s.userId === userId && s.status === 'active');
+    const hasSuspension = active.some(s => s.type === 'suspension3Days');
+    const desired = new Set(); let roleSyncSucceeded = true;
+    for (const type of ['warn1', 'warn2']) if (hasSuspension || active.some(s => s.type === type && s.expiresAt > Date.now())) desired.add(tierRoleId(type));
+    if (hasSuspension) desired.add(tierRoleId('suspension3Days'));
+    for (const type of ['warn1', 'warn2', 'suspension3Days']) {
+      const roleId = tierRoleId(type); const present = member.roles.cache.has(roleId); const want = desired.has(roleId);
+      try {
+        if (want && !present) await member.roles.add(roleId, 'Réconciliation automatique des sanctions persistées');
+        else if (!want && present) await member.roles.remove(roleId, 'Expiration/réconciliation automatique des sanctions');
+      } catch (error) { roleSyncSucceeded = false; console.error(`Rôle ${roleId} non synchronisé pour ${userId}:`, error.message); }
+    }
+    if (roleSyncSucceeded) {
+      for (const sanction of state.sanctions.filter(s => s.userId === userId && s.expiryLogPending && !s.expiryRolesSynced)) {
+        sanction.expiryRolesSynced = true; changed = true;
+      }
+    }
+    for (const sanction of active) {
+      if (!sanction.roleApplied && member.roles.cache.has(tierRoleId(sanction.type))) { sanction.roleApplied = true; changed = true; }
+      if (!sanction.roleApplied && sanction.expiresAt > Date.now()) {
+        try { await member.roles.add(tierRoleId(sanction.type), 'Restauration d’une sanction persistée'); sanction.roleApplied = true; changed = true; }
+        catch (error) { console.error(`Restauration du rôle de sanction impossible pour ${userId}:`, error.message); }
+      }
+    }
+  }
+  if (changed) saveState();
+  await flushSanctionLogs();
+  } finally { sanctionReconcileRunning = false; }
+}
+async function ensureSanctionPanel() {
+  try { await ensureMessage(config.sanctionPanelChannelId, 'sanctionPanelMessageId', { embeds: [sanctionPanelEmbed()], components: [sanctionPanelRow()] }); }
+  catch (error) { console.error('Panneau des sanctions impossible :', error.message); }
+}
+const panelChecksInFlight = new Set();
+async function checkPersistentPanel(channelId, stateKey, payload, label) {
+  if (panelChecksInFlight.has(stateKey)) return;
+  panelChecksInFlight.add(stateKey);
+  try {
+    const channel = await fetchTextChannel(channelId);
+    const message = state[stateKey] ? await channel.messages.fetch(state[stateKey]).catch(() => null) : null;
+    if (!message || message.author.id !== client.user.id) {
+      await ensureMessage(channelId, stateKey, payload);
+      return;
+    }
+    const expectedButtonId = payload.components?.flatMap(row => row.components || []).map(component => component.customId || component.data?.custom_id)[0];
+    const hasButton = !expectedButtonId || message.components.some(row => row.components.some(component => component.customId === expectedButtonId));
+    if (!message.embeds.length || !hasButton) await message.edit(payload);
+  } catch (error) { console.error(`Vérification du panneau ${label} impossible :`, error.message); }
+  finally { panelChecksInFlight.delete(stateKey); }
+}
+async function checkSanctionPanel() {
+  await checkPersistentPanel(config.sanctionPanelChannelId, 'sanctionPanelMessageId', { embeds: [sanctionPanelEmbed()], components: [sanctionPanelRow()] }, 'sanctions');
+}
+async function checkRequestPanel() {
+  await checkPersistentPanel(config.absenceRequestChannelId, 'requestPanelMessageId', { embeds: [createPanelEmbed()], components: [createPanelRow()] }, 'demandes d’absence');
+}
 client.once('ready', async () => {
   try {
     await client.application.commands.set([], guildId);
@@ -241,10 +559,17 @@ client.once('ready', async () => {
   await ensureRequestPanel();
   await refreshBoard();
   await restorePendingReviews();
+  await ensureSanctionPanel();
+  await reconcileSanctions().catch(error => console.error('Réconciliation initiale des sanctions impossible :', error));
   setInterval(refreshBoard, 60_000);
+  const panelTimer = setInterval(() => { checkRequestPanel(); checkSanctionPanel(); }, 60_000);
+  panelTimer.unref?.();
+  const sanctionTimer = setInterval(() => reconcileSanctions().catch(error => console.error('Réconciliation des sanctions impossible :', error)), 30_000);
+  sanctionTimer.unref?.();
 });
 client.on('interactionCreate', async interaction => {
   try {
+    if (await handleSanctionInteraction(interaction)) return;
     if (interaction.guildId !== guildId) return;
     if (interaction.isButton() && interaction.customId === 'absence:create') {
       if (interaction.channelId !== config.absenceRequestChannelId) return interaction.reply({ content: 'Utilise le panneau de demande configuré.', ephemeral: true });
@@ -278,7 +603,8 @@ client.on('interactionCreate', async interaction => {
     }
   } catch (error) {
     console.error('Erreur de traitement d’interaction :', error);
-    if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) await interaction.reply({ content: 'Une erreur est survenue. Réessaie ou contacte un administrateur.', ephemeral: true }).catch(() => {});
+    if (interaction.isRepliable() && interaction.deferred && !interaction.replied) await interaction.editReply('Une erreur est survenue. Vérifie le salon des logs ou contacte un administrateur.').catch(() => {});
+    else if (interaction.isRepliable() && !interaction.replied) await interaction.reply({ content: 'Une erreur est survenue. Réessaie ou contacte un administrateur.', ephemeral: true }).catch(() => {});
   }
 });
 client.on('error', error => console.error('Discord client error:', error));

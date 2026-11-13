@@ -4,5 +4,17 @@
   "absenceBoardChannelId": "ID_SALON_AFFICHAGE_ABSENCES",
   "absenceRequestChannelId": "ID_SALON_DEMANDE_ABSENCE",
   "absenceReviewChannelId": "ID_SALON_VALIDATION_ABSENCES",
+  "sanctionPanelChannelId": "ID_SALON_PANNEAU_SANCTIONS",
+  "sanctionLogChannelId": "ID_SALON_JOURNAL_SANCTIONS",
+  "sanctionRoles": {
+    "warn1": "ID_ROLE_WARN_1",
+    "warn2": "ID_ROLE_WARN_2",
+    "suspension3Days": "ID_ROLE_MISE_A_PIED_3_JOURS"
+  },
+  "sanctionDurationsDays": {
+    "warn1": 7,
+    "warn2": 7,
+    "suspension3Days": 3
+  },
   "timezone": "Europe/Paris"
 }
