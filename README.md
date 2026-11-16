@@ -23,7 +23,7 @@ Le panneau propose aussi **Enlever une sanction** : le staff sélectionne un mem
 ## Salons d’absence dans `config.json`
 
 - `absenceBoardChannelId` : panneau actualisé chaque minute avec les absences **acceptées et en cours**. Les demandes futures et les absences terminées n’y figurent pas.
-- `absenceRequestChannelId` : panneau avec bouton ouvrant le formulaire de demande.
+- `absenceRequestChannelId` : panneau avec boutons pour créer une demande et retirer ses propres demandes en attente ou absences acceptées à venir/en cours. La suppression ouvre une liste privée limitée aux absences de la personne connectée.
 - `absenceReviewChannelId` : demandes avec boutons Accepter/Refuser. Le refus ouvre un formulaire de motif ; le bot envoie ce motif en MP à la personne ayant fait la demande.
 - `timezone` : fuseau des heures entrées et affichées, par défaut `Europe/Paris`.
 
@@ -31,6 +31,6 @@ Entrer les dates au format `JJ/MM/AAAA HH:MM`, par exemple `05/11/2026 14:30`. L
 
 ## Stockage et panneaux
 
-Les absences, sanctions, échéances et IDs des messages de panneau (dont le panneau de sanctions) sont stockés dans `absences.json` à côté du bot (créé automatiquement, ignoré par Git). Le tableau des absences utilise cet ID et édite le message chaque minute. Si le message a été supprimé ou n’est plus accessible, le bot en crée un nouveau et sauvegarde son ID. Les panneaux de demande et de sanctions sont également vérifiés chaque minute et recréés si leur message manque. Les demandes en attente et les échéances de sanctions sont conservées au redémarrage.
+Les absences, sanctions, échéances et IDs des messages de panneau (dont le panneau de sanctions) sont stockés dans `absences.json` à côté du bot (créé automatiquement, ignoré par Git). Le tableau des absences utilise cet ID et édite le message chaque minute. Si le message a été supprimé ou n’est plus accessible, le bot en crée un nouveau et sauvegarde son ID. Les panneaux de demande et de sanctions sont également vérifiés chaque minute et recréés si leur message manque. Les demandes en attente, annulations, historique des décisions et échéances de sanctions sont conservés au redémarrage.
 
 Configure les permissions Discord des salons pour contrôler l’accès : les personnes pouvant voir le salon des demandes peuvent soumettre une demande ; celles pouvant voir le salon de validation peuvent traiter les boutons. Une personne doit autoriser les messages privés du bot pour recevoir le motif d’un refus.

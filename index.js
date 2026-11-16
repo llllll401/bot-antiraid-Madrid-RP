@@ -51,7 +51,7 @@ function loadState() {
   }
   const absences = parsed.absences.filter(a => a && typeof a === 'object' && typeof a.id === 'string' &&
     isSnowflake(a.userId) && typeof a.reason === 'string' && Number.isFinite(a.startAt) && Number.isFinite(a.endAt) &&
-    a.endAt > a.startAt && ['pending', 'approved', 'rejected'].includes(a.status));
+    a.endAt > a.startAt && ['pending', 'approved', 'rejected', 'cancelled'].includes(a.status));
   const rawSanctions = Array.isArray(parsed.sanctions) ? parsed.sanctions : [];
   const sanctions = rawSanctions.filter(s => s && typeof s === 'object' && typeof s.id === 'string' &&
     isSnowflake(s.userId) && isSnowflake(s.moderatorId) && typeof s.reason === 'string' &&
@@ -112,7 +112,10 @@ function createPanelEmbed() {
     .setFooter({ text: 'Une demande sera envoyée au salon de validation.' });
 }
 function createPanelRow() {
-  return new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('absence:create').setLabel('Créer une demande d’absence').setStyle(ButtonStyle.Primary));
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('absence:create').setLabel('Créer une demande d’absence').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('absence:cancel-open').setLabel('Retirer une absence').setStyle(ButtonStyle.Secondary)
+  );
 }
 function createRequestModal() {
   return new ModalBuilder().setCustomId('absence:submit').setTitle('Demande d’absence').addComponents(
@@ -122,9 +125,11 @@ function createRequestModal() {
   );
 }
 function formatReviewEmbed(absence) {
-  return new EmbedBuilder().setColor(absence.status === 'pending' ? 0xf1c40f : absence.status === 'approved' ? 0x2ecc71 : 0xe74c3c)
-    .setTitle(absence.status === 'pending' ? 'Demande d’absence à traiter' : `Demande ${absence.status === 'approved' ? 'acceptée' : 'refusée'}`)
-    .setDescription(`**Personne :** <@${absence.userId}>\n**Motif :** ${safeText(absence.reason)}\n**Départ :** ${displayDate(absence.startAt)}\n**Retour :** ${displayDate(absence.endAt)}${absence.decisionReason ? `\n**Motif du refus :** ${safeText(absence.decisionReason)}` : ''}`)
+  const cancelled = absence.status === 'cancelled';
+  const title = absence.status === 'pending' ? 'Demande d’absence à traiter' : cancelled ? 'Absence annulée par la personne' : `Demande ${absence.status === 'approved' ? 'acceptée' : 'refusée'}`;
+  const color = absence.status === 'pending' ? 0xf1c40f : absence.status === 'approved' ? 0x2ecc71 : cancelled ? 0x95a5a6 : 0xe74c3c;
+  return new EmbedBuilder().setColor(color).setTitle(title)
+    .setDescription(`**Personne :** <@${absence.userId}>\n**Motif :** ${safeText(absence.reason)}\n**Départ :** ${displayDate(absence.startAt)}\n**Retour :** ${displayDate(absence.endAt)}${absence.decisionReason ? `\n**Motif du refus :** ${safeText(absence.decisionReason)}` : ''}${cancelled ? `\n**Annulée le :** ${displayDate(absence.cancelledAt || Date.now())}` : ''}`)
     .setFooter({ text: `Demande ${absence.id}` }).setTimestamp(absence.createdAt);
 }
 function reviewButtons(absence) {
@@ -186,9 +191,11 @@ async function postReview(absence) {
   }
 }
 async function restorePendingReviews() {
-  for (const absence of state.absences.filter(a => a.status === 'pending')) {
-    try { await postReview(absence); }
-    catch (error) { console.error(`Restauration de la demande ${absence.id} impossible :`, error.message); }
+  for (const absence of state.absences.filter(a => a.status === 'pending' || (a.status === 'cancelled' && a.reviewSyncPending))) {
+    try {
+      await postReview(absence);
+      if (absence.status === 'cancelled' && absence.reviewSyncPending) { delete absence.reviewSyncPending; saveState(); }
+    } catch (error) { console.error(`Restauration de la demande ${absence.id} impossible :`, error.message); }
   }
 }
 async function submitAbsence(interaction) {
@@ -218,9 +225,83 @@ async function submitAbsence(interaction) {
   }
   return interaction.editReply('Ta demande d’absence a été envoyée pour validation.');
 }
+const cancellationWizardByMessage = new Map();
+const absenceCancellationInFlight = new Set();
+function cancellableAbsences(userId) {
+  const now = Date.now();
+  return state.absences.filter(a => a.userId === userId && ['pending', 'approved'].includes(a.status) && a.endAt > now)
+    .sort((a, b) => a.startAt - b.startAt);
+}
+function cancellationComponents(w) {
+  const options = (w.options || []).slice(0, 25).map(a => {
+    const label = `${displayDate(a.startAt)} — ${safeText(a.reason, 65)}`.slice(0, 100);
+    const status = a.status === 'pending' ? 'En attente de validation' : a.startAt <= Date.now() ? 'En cours' : 'À venir';
+    return new StringSelectMenuOptionBuilder().setLabel(label).setDescription(status).setValue(a.id).setDefault(w.absenceId === a.id);
+  });
+  return [
+    new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('absence:cancel-select').setPlaceholder('Choisir une absence à retirer').setMinValues(1).setMaxValues(1).addOptions(options)),
+    new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('absence:cancel-confirm').setLabel('Confirmer la suppression').setStyle(ButtonStyle.Danger).setDisabled(!w.absenceId))
+  ];
+}
+async function openCancellationWizard(interaction) {
+  const options = cancellableAbsences(interaction.user.id);
+  if (!options.length) return interaction.reply({ content: 'Tu n’as aucune absence à venir ou en cours à retirer.', ephemeral: true });
+  const w = { ownerId: interaction.user.id, absenceId: null, options };
+  const message = await interaction.reply({ content: 'Voici tes absences à venir ou en cours (ainsi que tes demandes en attente). Choisis celle que tu veux retirer.', components: cancellationComponents(w), ephemeral: true, fetchReply: true, allowedMentions: { parse: [] } });
+  cancellationWizardByMessage.set(message.id, w);
+  const timer = setTimeout(() => cancellationWizardByMessage.delete(message.id), 15 * 60_000); timer.unref?.();
+}
+async function handleAbsenceCancellation(interaction) {
+  if (interaction.isButton() && interaction.customId === 'absence:cancel-open') {
+    if (interaction.guildId !== guildId || interaction.channelId !== config.absenceRequestChannelId) {
+      await interaction.reply({ content: 'Utilise le bouton du salon de demandes configuré.', ephemeral: true }); return true;
+    }
+    await openCancellationWizard(interaction); return true;
+  }
+  if (interaction.isStringSelectMenu() && interaction.customId === 'absence:cancel-select') {
+    const w = cancellationWizardByMessage.get(interaction.message?.id);
+    if (!w || w.ownerId !== interaction.user.id || interaction.channelId !== config.absenceRequestChannelId) {
+      await interaction.reply({ content: 'Ce formulaire a expiré ou ne t’appartient pas.', ephemeral: true }); return true;
+    }
+    const options = cancellableAbsences(interaction.user.id);
+    const selected = options.find(a => a.id === interaction.values[0]);
+    if (!selected) { await interaction.update({ content: 'Cette absence n’est plus disponible.', components: [] }); cancellationWizardByMessage.delete(interaction.message.id); return true; }
+    w.options = options; w.absenceId = selected.id;
+    await interaction.update({ content: `Confirme le retrait de **${displayDate(selected.startAt)} — ${safeText(selected.reason, 100)}** (${selected.status === 'pending' ? 'demande en attente' : selected.startAt <= Date.now() ? 'absence en cours' : 'absence à venir'}).`, components: cancellationComponents(w), allowedMentions: { parse: [] } });
+    return true;
+  }
+  if (interaction.isButton() && interaction.customId === 'absence:cancel-confirm') {
+    const w = cancellationWizardByMessage.get(interaction.message?.id);
+    if (!w || w.ownerId !== interaction.user.id || interaction.channelId !== config.absenceRequestChannelId || !w.absenceId) {
+      await interaction.reply({ content: 'Ce formulaire a expiré ou ne t’appartient pas.', ephemeral: true }); return true;
+    }
+    cancellationWizardByMessage.delete(interaction.message.id);
+    await interaction.deferReply({ ephemeral: true });
+    const absence = state.absences.find(a => a.id === w.absenceId && a.userId === interaction.user.id && ['pending', 'approved'].includes(a.status) && a.endAt > Date.now());
+    if (!absence) return interaction.editReply('Cette absence n’est plus disponible à la suppression.');
+    if (absenceCancellationInFlight.has(absence.id)) return interaction.editReply('Le retrait de cette absence est déjà en cours.');
+    absenceCancellationInFlight.add(absence.id);
+    const previous = { status: absence.status, cancelledBy: absence.cancelledBy, cancelledAt: absence.cancelledAt, reviewSyncPending: absence.reviewSyncPending };
+    absence.status = 'cancelled'; absence.cancelledBy = interaction.user.id; absence.cancelledAt = Date.now(); absence.reviewSyncPending = true;
+    try { saveState(); }
+    catch (error) {
+      Object.assign(absence, previous);
+      console.error('Sauvegarde de l’annulation impossible :', error);
+      absenceCancellationInFlight.delete(absence.id);
+      return interaction.editReply('L’annulation n’a pas pu être enregistrée. Réessaie.');
+    }
+    try { await postReview(absence); delete absence.reviewSyncPending; saveState(); }
+    catch (error) { console.error('Absence annulée mais synchronisation du message de validation en attente :', error); }
+    absenceCancellationInFlight.delete(absence.id);
+    await refreshBoard();
+    return interaction.editReply('Ton absence a été retirée.');
+  }
+  return false;
+}
 async function decideAbsence(interaction, absence, decision, refusalReason = null) {
   if (absence.status !== 'pending') return interaction.reply({ content: 'Cette demande a déjà été traitée.', ephemeral: true });
   await interaction.deferReply({ ephemeral: true });
+  if (absence.status !== 'pending') return interaction.editReply('Cette demande a déjà été traitée ou annulée.');
   const previous = { status: absence.status, decidedBy: absence.decidedBy, decidedAt: absence.decidedAt, decisionReason: absence.decisionReason };
   absence.status = decision;
   absence.decidedBy = interaction.user.id;
@@ -692,6 +773,7 @@ client.on('interactionCreate', async interaction => {
   try {
     if (await handleSanctionInteraction(interaction)) return;
     if (interaction.guildId !== guildId) return;
+    if (await handleAbsenceCancellation(interaction)) return;
     if (interaction.isButton() && interaction.customId === 'absence:create') {
       if (interaction.channelId !== config.absenceRequestChannelId) return interaction.reply({ content: 'Utilise le panneau de demande configuré.', ephemeral: true });
       return interaction.showModal(createRequestModal());
