@@ -55,7 +55,7 @@ function loadState() {
   const rawSanctions = Array.isArray(parsed.sanctions) ? parsed.sanctions : [];
   const sanctions = rawSanctions.filter(s => s && typeof s === 'object' && typeof s.id === 'string' &&
     isSnowflake(s.userId) && isSnowflake(s.moderatorId) && typeof s.reason === 'string' &&
-    ['warn1', 'warn2', 'suspension3Days'].includes(s.type) && ['active', 'expired', 'cleared', 'failed'].includes(s.status) &&
+    ['warn1', 'warn2', 'suspension3Days'].includes(s.type) && ['active', 'expired', 'cleared', 'revoked', 'failed'].includes(s.status) &&
     Number.isFinite(s.issuedAt) && Number.isFinite(s.expiresAt) && s.expiresAt > s.issuedAt);
   if (absences.length !== parsed.absences.length || sanctions.length !== rawSanctions.length) console.warn('Certaines entrées invalides de absences.json ont été ignorées.');
   return {
@@ -253,13 +253,17 @@ const tierDurationMs = type => sanctionDurations[type] * DAY_MS;
 const activeFor = (userId, type, now = Date.now()) => state.sanctions.filter(s => s.userId === userId && s.type === type && s.status === 'active' && s.expiresAt > now);
 function sanctionPanelEmbed() {
   return new EmbedBuilder().setColor(0xc0392b).setTitle('Panneau des sanctions')
-    .setDescription('Clique sur le bouton pour choisir une personne et une sanction disponible. Ensuite, saisis le motif dans le modal, puis sélectionne jusqu’à cinq rôles à mentionner dans le journal.')
+    .setDescription('Utilise **Créer une sanction** pour attribuer une sanction, ou **Enlever une sanction** pour retirer un niveau et tous les niveaux suivants. Les retraits sont consignés dans le journal.')
     .setFooter({ text: 'Les rôles de sanction expirent automatiquement, y compris après un redémarrage.' });
 }
 function sanctionPanelRow() {
-  return new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('sanction:open').setLabel('Créer une sanction').setStyle(ButtonStyle.Danger));
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('sanction:open').setLabel('Créer une sanction').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId('sanction:remove').setLabel('Enlever une sanction').setStyle(ButtonStyle.Secondary)
+  );
 }
 function sanctionWorkflowDescription(w) {
+  if (w.kind === 'revoke') return `**Personne :** ${w.targetUserId ? `<@${w.targetUserId}>` : 'à choisir'}\n**Sanction à retirer :** ${w.type ? tierNames[w.type] : 'à choisir'}`;
   return `**Personne :** ${w.targetUserId ? `<@${w.targetUserId}>` : 'à choisir'}\n**Sanction :** ${w.type ? tierNames[w.type] : 'à choisir'}\n**Rôles à mentionner :** ${w.mentionRoleIds.length ? w.mentionRoleIds.map(id => `<@&${id}>`).join(' ') : 'aucun'}`;
 }
 function eligibleTiers(member) {
@@ -269,6 +273,25 @@ function eligibleTiers(member) {
   const hasWarn1 = member.roles.cache.has(tierRoleId('warn1')) && activeFor(member.id, 'warn1', now).length > 0;
   const hasWarn2 = member.roles.cache.has(tierRoleId('warn2')) && activeFor(member.id, 'warn2', now).length > 0;
   return ['warn1', ...(hasWarn1 ? ['warn2'] : []), ...(hasWarn1 && hasWarn2 ? ['suspension3Days'] : [])];
+}
+function revocableTiers(member) {
+  if (!member) return [];
+  return ['warn1', 'warn2', 'suspension3Days'].filter(type =>
+    member.roles.cache.has(tierRoleId(type)) && state.sanctions.some(s => s.userId === member.id && s.type === type && s.status === 'active')
+  );
+}
+function revokeWizardComponents(w) {
+  const userSelect = new UserSelectMenuBuilder().setCustomId('sanction:target').setPlaceholder('1. Choisir la personne').setMinValues(1).setMaxValues(1);
+  if (w.targetUserId) userSelect.setDefaultUsers(w.targetUserId);
+  const options = w.allowedTiers?.length
+    ? w.allowedTiers.map(type => new StringSelectMenuOptionBuilder().setLabel(tierNames[type]).setValue(type).setDefault(w.type === type))
+    : [new StringSelectMenuOptionBuilder().setLabel('Aucune sanction active').setValue('none')];
+  const tierSelect = new StringSelectMenuBuilder().setCustomId('sanction:tier').setPlaceholder('2. Choisir la sanction à retirer').setMinValues(1).setMaxValues(1).addOptions(options);
+  return [
+    new ActionRowBuilder().addComponents(userSelect),
+    new ActionRowBuilder().addComponents(tierSelect),
+    new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('sanction:remove-confirm').setLabel('Confirmer le retrait').setStyle(ButtonStyle.Danger).setDisabled(!w.targetUserId || !w.type))
+  ];
 }
 function wizardComponents(w) {
   const userSelect = new UserSelectMenuBuilder().setCustomId('sanction:target').setPlaceholder('1. Choisir la personne').setMinValues(1).setMaxValues(1);
@@ -296,8 +319,14 @@ function workflowFrom(interaction) {
   return w && w.ownerId === interaction.user.id && interaction.channelId === config.sanctionPanelChannelId ? w : null;
 }
 async function openSanctionWizard(interaction) {
-  const w = { ownerId: interaction.user.id, guildId, targetUserId: null, type: null, allowedTiers: ['warn1'], mentionRoleIds: [] };
+  const w = { kind: 'issue', ownerId: interaction.user.id, guildId, targetUserId: null, type: null, allowedTiers: ['warn1'], mentionRoleIds: [] };
   const message = await interaction.reply({ content: sanctionWorkflowDescription(w), components: wizardComponents(w), ephemeral: true, fetchReply: true, allowedMentions: { parse: [] } });
+  wizardByMessage.set(message.id, w);
+  const timer = setTimeout(() => wizardByMessage.delete(message.id), 15 * 60_000); timer.unref?.();
+}
+async function openRevokeWizard(interaction) {
+  const w = { kind: 'revoke', ownerId: interaction.user.id, guildId, targetUserId: null, type: null, allowedTiers: [] };
+  const message = await interaction.reply({ content: sanctionWorkflowDescription(w), components: revokeWizardComponents(w), ephemeral: true, fetchReply: true, allowedMentions: { parse: [] } });
   wizardByMessage.set(message.id, w);
   const timer = setTimeout(() => wizardByMessage.delete(message.id), 15 * 60_000); timer.unref?.();
 }
@@ -319,12 +348,26 @@ async function handleSanctionInteraction(interaction) {
     }
     await openSanctionWizard(interaction); return true;
   }
+  if (interaction.isButton() && interaction.customId === 'sanction:remove') {
+    if (interaction.guildId !== guildId || interaction.channelId !== config.sanctionPanelChannelId) {
+      await interaction.reply({ content: 'Utilise le panneau du salon de sanctions configuré.', ephemeral: true }); return true;
+    }
+    await openRevokeWizard(interaction); return true;
+  }
   if (interaction.isUserSelectMenu() && interaction.customId === 'sanction:target') {
     const w = workflowFrom(interaction); if (!w) { await interaction.reply({ content: 'Ce formulaire a expiré ou ne t’appartient pas.', ephemeral: true }); return true; }
     await interaction.deferUpdate();
     const member = await interaction.guild.members.fetch({ user: interaction.values[0], force: true }).catch(() => null);
-    if (!member) { await interaction.editReply({ content: 'Cette personne n’est plus membre du serveur.', components: wizardComponents(w) }); return true; }
-    w.targetUserId = member.id; w.allowedTiers = eligibleTiers(member);
+    if (!member) { await interaction.editReply({ content: 'Cette personne n’est plus membre du serveur.', components: w.kind === 'revoke' ? revokeWizardComponents(w) : wizardComponents(w) }); return true; }
+    w.targetUserId = member.id;
+    if (w.kind === 'revoke') {
+      w.allowedTiers = revocableTiers(member);
+      if (!w.allowedTiers.includes(w.type)) w.type = null;
+      const note = w.allowedTiers.length ? '' : '\nAucune sanction active à retirer pour cette personne.';
+      await interaction.editReply({ content: `${sanctionWorkflowDescription(w)}${note}`, components: revokeWizardComponents(w), allowedMentions: { parse: [] } });
+      return true;
+    }
+    w.allowedTiers = eligibleTiers(member);
     if (!w.allowedTiers.includes(w.type)) w.type = null;
     await refreshWizard(interaction, w); return true;
   }
@@ -332,15 +375,35 @@ async function handleSanctionInteraction(interaction) {
     const w = workflowFrom(interaction); if (!w) { await interaction.reply({ content: 'Ce formulaire a expiré ou ne t’appartient pas.', ephemeral: true }); return true; }
     await interaction.deferUpdate();
     const member = w.targetUserId ? await interaction.guild.members.fetch({ user: w.targetUserId, force: true }).catch(() => null) : null;
-    w.allowedTiers = eligibleTiers(member);
+    w.allowedTiers = w.kind === 'revoke' ? revocableTiers(member) : eligibleTiers(member);
     if (!w.allowedTiers.includes(interaction.values[0])) {
-      w.type = null; await interaction.editReply({ content: `${sanctionWorkflowDescription(w)}\n⚠️ Cette sanction n’est pas disponible : la séquence de rôles requise n’est pas active.`, components: wizardComponents(w), allowedMentions: { parse: [] } }); return true;
+      w.type = null;
+      const text = w.kind === 'revoke' ? '⚠️ Cette sanction n’est plus active.' : '⚠️ Cette sanction n’est pas disponible : la séquence de rôles requise n’est pas active.';
+      await interaction.editReply({ content: `${sanctionWorkflowDescription(w)}\n${text}`, components: w.kind === 'revoke' ? revokeWizardComponents(w) : wizardComponents(w), allowedMentions: { parse: [] } }); return true;
     }
-    w.type = interaction.values[0]; await refreshWizard(interaction, w); return true;
+    w.type = interaction.values[0];
+    if (w.kind === 'revoke') {
+      const rank = { warn1: 1, warn2: 2, suspension3Days: 3 }[w.type];
+      const cascade = rank === 1 ? 'Warn 1 et tous les niveaux supérieurs seront retirés.' : rank === 2 ? 'Warn 2 et la mise à pied seront retirés.' : 'Seule la mise à pied sera retirée.';
+      await interaction.editReply({ content: `${sanctionWorkflowDescription(w)}\n⚠️ ${cascade}`, components: revokeWizardComponents(w), allowedMentions: { parse: [] } });
+    }
+    else await refreshWizard(interaction, w);
+    return true;
   }
   if (interaction.isRoleSelectMenu() && interaction.customId === 'sanction:mentions') {
     const w = workflowFrom(interaction); if (!w) { await interaction.reply({ content: 'Ce formulaire a expiré ou ne t’appartient pas.', ephemeral: true }); return true; }
     w.mentionRoleIds = interaction.values.slice(0, 5); await refreshWizard(interaction, w); return true;
+  }
+  if (interaction.isButton() && interaction.customId === 'sanction:remove-confirm') {
+    const w = workflowFrom(interaction);
+    if (!w || w.kind !== 'revoke' || !w.targetUserId || !w.type) { await interaction.reply({ content: 'Choisis une personne et une sanction active à retirer.', ephemeral: true }); return true; }
+    wizardByMessage.delete(interaction.message.id);
+    await interaction.deferReply({ ephemeral: true });
+    const member = await interaction.guild.members.fetch({ user: w.targetUserId, force: true }).catch(() => null);
+    if (!member || !revocableTiers(member).includes(w.type)) {
+      await interaction.editReply('Cette sanction n’est plus active ou la personne n’est plus sur le serveur.'); return true;
+    }
+    await revokeSanction(interaction, member, w.type); return true;
   }
   if (interaction.isButton() && interaction.customId === 'sanction:apply') {
     const w = workflowFrom(interaction);
@@ -383,6 +446,40 @@ async function issueSanction(interaction, w, reason) {
   try { return await applySanction(interaction, w, reason); }
   finally { sanctionIssueInFlight.delete(key); }
 }
+const sanctionRanks = { warn1: 1, warn2: 2, suspension3Days: 3 };
+const sanctionRemovalInFlight = new Set();
+async function revokeSanction(interaction, member, type) {
+  if (sanctionRemovalInFlight.has(member.id)) return interaction.editReply('Un retrait de sanction est déjà en cours pour cette personne.');
+  sanctionRemovalInFlight.add(member.id);
+  try {
+    const rank = sanctionRanks[type];
+    const impacted = state.sanctions.filter(s => s.userId === member.id && s.status === 'active' && sanctionRanks[s.type] >= rank);
+    if (!impacted.length) return interaction.editReply('Aucune sanction active de ce niveau ou supérieure n’a été trouvée.');
+    const now = Date.now();
+    const snapshots = impacted.map(s => ({ sanction: s, data: { ...s } }));
+    for (const sanction of impacted) {
+      sanction.status = 'revoked';
+      sanction.revokedBy = interaction.user.id;
+      sanction.revokedAt = now;
+      sanction.revocationCascadeFrom = type;
+      sanction.revocationLogPending = true;
+      sanction.removalRolesSynced = false;
+      if (!sanction.roleApplied) sanction.createdLogPending = false;
+    }
+    try { saveState(); }
+    catch (error) {
+      for (const { sanction, data } of snapshots) { for (const key of Object.keys(sanction)) delete sanction[key]; Object.assign(sanction, data); }
+      console.error('Enregistrement du retrait de sanction impossible :', error);
+      return interaction.editReply('Le retrait n’a pas pu être enregistré. Aucune modification n’a été appliquée.');
+    }
+    await reconcileSanctions();
+    const removedTypes = Object.keys(sanctionRanks).filter(t => sanctionRanks[t] >= rank);
+    const stillPresent = removedTypes.filter(t => member.roles.cache.has(tierRoleId(t)) && !state.sanctions.some(s => s.userId === member.id && s.type === t && s.status === 'active'));
+    if (stillPresent.length) return interaction.editReply('Le retrait est sauvegardé, mais un ou plusieurs rôles n’ont pas pu être enlevés. Le bot réessaiera automatiquement ; vérifie sa permission Gérer les rôles et la hiérarchie.');
+    const cascadeText = rank === 1 ? 'Warn 1 et les sanctions suivantes retirés.' : rank === 2 ? 'Warn 2 et les sanctions suivantes retirés.' : 'Mise à pied retirée.';
+    return interaction.editReply(cascadeText);
+  } finally { sanctionRemovalInFlight.delete(member.id); }
+}
 async function applySanction(interaction, w, reason) {
   const guild = interaction.guild;
   const member = await guild.members.fetch({ user: w.targetUserId, force: true }).catch(() => null);
@@ -421,18 +518,22 @@ async function applySanction(interaction, w, reason) {
   await flushSanctionLogs();
   return interaction.editReply(`${tierNames[w.type]} appliqué à <@${member.id}> jusqu’au ${displayDate(expiresAt)}.`);
 }
-function sanctionLogEmbed(sanction, expired = false, cleared = false) {
-  const title = expired ? `Sanction expirée — ${tierNames[sanction.type]}` : cleared ? 'Sanction retirée — fin de mise à pied' : `Sanction appliquée — ${tierNames[sanction.type]}`;
-  const dateLabel = expired ? 'Expirée le' : cleared ? 'Retirée le' : 'Expire le';
-  const eventTime = expired ? sanction.expiresAt : cleared ? (sanction.clearedAt || Date.now()) : sanction.issuedAt;
-  return new EmbedBuilder().setColor(expired || cleared ? 0x95a5a6 : 0xe74c3c).setTitle(title)
-    .setDescription(`**Personne :** <@${sanction.userId}>\n**Membre du staff :** <@${sanction.moderatorId}>\n**Motif :** ${safeText(sanction.reason, 800)}\n**${dateLabel} :** ${displayDate(expired || cleared ? eventTime : sanction.expiresAt)}${sanction.type === 'suspension3Days' && (expired || cleared) ? '\nLes rôles Warn 1 et Warn 2 ont aussi été retirés.' : ''}`)
+function sanctionLogEmbed(sanction, mode = 'created') {
+  const expired = mode === 'expired', cleared = mode === 'cleared', revoked = mode === 'revoked';
+  const title = expired ? `Sanction expirée — ${tierNames[sanction.type]}` : cleared ? 'Sanction retirée — fin de mise à pied' : revoked ? `Sanction retirée — ${tierNames[sanction.type]}` : `Sanction appliquée — ${tierNames[sanction.type]}`;
+  const eventTime = expired ? sanction.expiresAt : cleared ? (sanction.clearedAt || Date.now()) : revoked ? (sanction.revokedAt || Date.now()) : sanction.issuedAt;
+  const dateLabel = expired ? 'Expirée le' : cleared || revoked ? 'Retirée le' : 'Expire le';
+  const staffId = revoked ? sanction.revokedBy : sanction.moderatorId;
+  const staffLabel = revoked ? 'Retrait effectué par' : 'Membre du staff';
+  const cascade = revoked ? `\n**Action :** retrait de ${tierNames[sanction.revocationCascadeFrom] || 'la sanction'} et des sanctions suivantes.` : '';
+  return new EmbedBuilder().setColor(expired || cleared || revoked ? 0x95a5a6 : 0xe74c3c).setTitle(title)
+    .setDescription(`**Personne :** <@${sanction.userId}>\n**${staffLabel} :** <@${staffId}>\n**Motif :** ${safeText(sanction.reason, 800)}\n**${dateLabel} :** ${displayDate(expired || cleared || revoked ? eventTime : sanction.expiresAt)}${sanction.type === 'suspension3Days' && (expired || cleared) ? '\nLes rôles Warn 1 et Warn 2 ont aussi été retirés.' : ''}${cascade}`)
     .setFooter({ text: `Sanction ${sanction.id}` }).setTimestamp(eventTime);
 }
 async function sendSanctionLog(sanction, mode) {
   const channel = await fetchTextChannel(config.sanctionLogChannelId);
   const content = mode === 'created' && sanction.mentionRoleIds?.length ? sanction.mentionRoleIds.map(id => `<@&${id}>`).join(' ') : undefined;
-  await channel.send({ content, embeds: [sanctionLogEmbed(sanction, mode === 'expired', mode === 'cleared')], allowedMentions: { parse: [], roles: mode === 'created' ? sanction.mentionRoleIds || [] : [] } });
+  await channel.send({ content, embeds: [sanctionLogEmbed(sanction, mode)], allowedMentions: { parse: [], roles: mode === 'created' ? sanction.mentionRoleIds || [] : [] } });
 }
 let sanctionLogFlushRunning = false;
 async function flushSanctionLogs() {
@@ -448,14 +549,29 @@ async function flushSanctionLogs() {
       try { await sendSanctionLog(sanction, sanction.status === 'cleared' ? 'cleared' : 'expired'); sanction.expiryLogPending = false; saveState(); }
       catch (error) { console.error(`Journal d’expiration ${sanction.id} indisponible (réessai automatique):`, error.message); }
     }
+    if (sanction.revocationLogPending && sanction.removalRolesSynced) {
+      try { await sendSanctionLog(sanction, 'revoked'); sanction.revocationLogPending = false; saveState(); }
+      catch (error) { console.error(`Journal de retrait ${sanction.id} indisponible (réessai automatique):`, error.message); }
+    }
   }
   } finally { sanctionLogFlushRunning = false; }
 }
-let sanctionReconcileRunning = false;
-async function reconcileSanctions() {
-  if (sanctionReconcileRunning) return;
-  sanctionReconcileRunning = true;
-  try {
+let sanctionReconcilePromise = null;
+let sanctionReconcileRequested = false;
+function reconcileSanctions() {
+  if (sanctionReconcilePromise) {
+    sanctionReconcileRequested = true;
+    return sanctionReconcilePromise;
+  }
+  sanctionReconcilePromise = (async () => {
+    do {
+      sanctionReconcileRequested = false;
+      await reconcileSanctionsPass();
+    } while (sanctionReconcileRequested);
+  })().finally(() => { sanctionReconcilePromise = null; });
+  return sanctionReconcilePromise;
+}
+async function reconcileSanctionsPass() {
   const now = Date.now(); let changed = false;
   const users = [...new Set(state.sanctions.filter(s => s.status === 'active').map(s => s.userId))];
   for (const userId of users) {
@@ -481,12 +597,15 @@ async function reconcileSanctions() {
     }
   }
   if (changed) saveState();
-  const affectedUsers = [...new Set(state.sanctions.filter(s => s.status === 'active' || (s.expiryLogPending && !s.expiryRolesSynced)).map(s => s.userId))];
+  const affectedUsers = [...new Set(state.sanctions.filter(s => s.status === 'active' || (s.expiryLogPending && !s.expiryRolesSynced) || (s.revocationLogPending && !s.removalRolesSynced)).map(s => s.userId))];
   for (const userId of affectedUsers) {
     const member = await client.guilds.cache.get(guildId)?.members.fetch({ user: userId, force: true }).catch(() => null);
     if (!member) {
       for (const sanction of state.sanctions.filter(s => s.userId === userId && s.expiryLogPending && !s.expiryRolesSynced)) {
         sanction.expiryRolesSynced = true; changed = true;
+      }
+      for (const sanction of state.sanctions.filter(s => s.userId === userId && s.revocationLogPending && !s.removalRolesSynced)) {
+        sanction.removalRolesSynced = true; changed = true;
       }
       continue;
     }
@@ -506,6 +625,9 @@ async function reconcileSanctions() {
       for (const sanction of state.sanctions.filter(s => s.userId === userId && s.expiryLogPending && !s.expiryRolesSynced)) {
         sanction.expiryRolesSynced = true; changed = true;
       }
+      for (const sanction of state.sanctions.filter(s => s.userId === userId && s.revocationLogPending && !s.removalRolesSynced)) {
+        sanction.removalRolesSynced = true; changed = true;
+      }
     }
     for (const sanction of active) {
       if (!sanction.roleApplied && member.roles.cache.has(tierRoleId(sanction.type))) { sanction.roleApplied = true; changed = true; }
@@ -517,7 +639,6 @@ async function reconcileSanctions() {
   }
   if (changed) saveState();
   await flushSanctionLogs();
-  } finally { sanctionReconcileRunning = false; }
 }
 async function ensureSanctionPanel() {
   try { await ensureMessage(config.sanctionPanelChannelId, 'sanctionPanelMessageId', { embeds: [sanctionPanelEmbed()], components: [sanctionPanelRow()] }); }
@@ -534,9 +655,9 @@ async function checkPersistentPanel(channelId, stateKey, payload, label) {
       await ensureMessage(channelId, stateKey, payload);
       return;
     }
-    const expectedButtonId = payload.components?.flatMap(row => row.components || []).map(component => component.customId || component.data?.custom_id)[0];
-    const hasButton = !expectedButtonId || message.components.some(row => row.components.some(component => component.customId === expectedButtonId));
-    if (!message.embeds.length || !hasButton) await message.edit(payload);
+    const expectedButtonIds = payload.components?.flatMap(row => row.components || []).map(component => component.customId || component.data?.custom_id) || [];
+    const hasButtons = expectedButtonIds.every(id => message.components.some(row => row.components.some(component => component.customId === id)));
+    if (!message.embeds.length || !hasButtons) await message.edit(payload);
   } catch (error) { console.error(`Vérification du panneau ${label} impossible :`, error.message); }
   finally { panelChecksInFlight.delete(stateKey); }
 }
