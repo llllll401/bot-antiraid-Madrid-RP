@@ -171,7 +171,12 @@ let boardRefreshRunning = false;
 async function refreshBoard() {
   if (boardRefreshRunning) return;
   boardRefreshRunning = true;
-  try { await ensureMessage(config.absenceBoardChannelId, 'boardMessageId', { embeds: [boardEmbed()], allowedMentions: { parse: [] } }); }
+  try {
+    const before = state.absences.length;
+    state.absences = state.absences.filter(a => a.status !== 'rejected' && !(a.status === 'approved' && a.endAt <= Date.now()));
+    if (state.absences.length !== before) saveState();
+    await ensureMessage(config.absenceBoardChannelId, 'boardMessageId', { embeds: [boardEmbed()], allowedMentions: { parse: [] } });
+  }
   catch (error) { console.error('Mise à jour du panneau des absences impossible :', error.message); }
   finally { boardRefreshRunning = false; }
 }
@@ -334,7 +339,7 @@ const tierDurationMs = type => sanctionDurations[type] * DAY_MS;
 const activeFor = (userId, type, now = Date.now()) => state.sanctions.filter(s => s.userId === userId && s.type === type && s.status === 'active' && s.expiresAt > now);
 function sanctionPanelEmbed() {
   return new EmbedBuilder().setColor(0xc0392b).setTitle('Panneau des sanctions')
-    .setDescription('Utilise **Créer une sanction** pour attribuer une sanction, ou **Enlever une sanction** pour retirer un niveau et tous les niveaux suivants. Les retraits sont consignés dans le journal.')
+    .setDescription('Utilise **Créer une sanction** pour attribuer une sanction, ou **Enlever une sanction** pour retirer un niveau. Les sanctions suivantes descendent d’un rang en conservant leur motif. Les retraits sont consignés dans le journal.')
     .setFooter({ text: 'Les rôles de sanction expirent automatiquement, y compris après un redémarrage.' });
 }
 function sanctionPanelRow() {
@@ -465,7 +470,7 @@ async function handleSanctionInteraction(interaction) {
     w.type = interaction.values[0];
     if (w.kind === 'revoke') {
       const rank = { warn1: 1, warn2: 2, suspension3Days: 3 }[w.type];
-      const cascade = rank === 1 ? 'Warn 1 et tous les niveaux supérieurs seront retirés.' : rank === 2 ? 'Warn 2 et la mise à pied seront retirés.' : 'Seule la mise à pied sera retirée.';
+      const cascade = rank === 1 ? 'Warn 1 sera retiré ; Warn 2 deviendra Warn 1 et la mise à pied deviendra Warn 2.' : rank === 2 ? 'Warn 2 sera retiré ; la mise à pied deviendra Warn 2.' : 'Seule la mise à pied sera retirée.';
       await interaction.editReply({ content: `${sanctionWorkflowDescription(w)}\n⚠️ ${cascade}`, components: revokeWizardComponents(w), allowedMentions: { parse: [] } });
     }
     else await refreshWizard(interaction, w);
@@ -537,15 +542,29 @@ async function revokeSanction(interaction, member, type) {
     const impacted = state.sanctions.filter(s => s.userId === member.id && s.status === 'active' && sanctionRanks[s.type] >= rank);
     if (!impacted.length) return interaction.editReply('Aucune sanction active de ce niveau ou supérieure n’a été trouvée.');
     const now = Date.now();
-    const snapshots = impacted.map(s => ({ sanction: s, data: { ...s } }));
+    const snapshots = state.sanctions.filter(s => s.userId === member.id && s.status === 'active').map(s => ({ sanction: s, data: { ...s } }));
+    const rankTypes = ['warn1', 'warn2', 'suspension3Days'];
     for (const sanction of impacted) {
-      sanction.status = 'revoked';
-      sanction.revokedBy = interaction.user.id;
-      sanction.revokedAt = now;
-      sanction.revocationCascadeFrom = type;
-      sanction.revocationLogPending = true;
-      sanction.removalRolesSynced = false;
-      if (!sanction.roleApplied) sanction.createdLogPending = false;
+      if (sanction.type === type) {
+        sanction.status = 'revoked';
+        sanction.revokedBy = interaction.user.id;
+        sanction.revokedAt = now;
+        sanction.revocationCascadeFrom = type;
+        sanction.revocationLogPending = true;
+        sanction.removalRolesSynced = false;
+        if (!sanction.roleApplied) sanction.createdLogPending = false;
+      } else {
+        const previousType = sanction.type;
+        sanction.type = rankTypes[sanctionRanks[previousType] - 2];
+        sanction.typeBeforePromotion = previousType;
+        sanction.promotedAt = now;
+        sanction.promotedByRemoval = type;
+        if (sanction.type === 'warn1') sanction.parentWarn1Id = null;
+        else if (sanction.type === 'warn2') {
+          const warn1 = state.sanctions.find(s => s.userId === member.id && s.status === 'active' && s.type === 'warn1' && s !== sanction);
+          sanction.parentWarn1Id = warn1?.id || null;
+        }
+      }
     }
     try { saveState(); }
     catch (error) {
@@ -557,7 +576,7 @@ async function revokeSanction(interaction, member, type) {
     const removedTypes = Object.keys(sanctionRanks).filter(t => sanctionRanks[t] >= rank);
     const stillPresent = removedTypes.filter(t => member.roles.cache.has(tierRoleId(t)) && !state.sanctions.some(s => s.userId === member.id && s.type === t && s.status === 'active'));
     if (stillPresent.length) return interaction.editReply('Le retrait est sauvegardé, mais un ou plusieurs rôles n’ont pas pu être enlevés. Le bot réessaiera automatiquement ; vérifie sa permission Gérer les rôles et la hiérarchie.');
-    const cascadeText = rank === 1 ? 'Warn 1 et les sanctions suivantes retirés.' : rank === 2 ? 'Warn 2 et les sanctions suivantes retirés.' : 'Mise à pied retirée.';
+    const cascadeText = rank === 1 ? 'Warn 1 retiré. Le Warn 2 est devenu Warn 1 et la mise à pied est devenue Warn 2 ; motifs et échéances conservés.' : rank === 2 ? 'Warn 2 retiré. La mise à pied est devenue Warn 2 ; motif et échéance conservés.' : 'Mise à pied retirée.';
     return interaction.editReply(cascadeText);
   } finally { sanctionRemovalInFlight.delete(member.id); }
 }
@@ -606,7 +625,7 @@ function sanctionLogEmbed(sanction, mode = 'created') {
   const dateLabel = expired ? 'Expirée le' : cleared || revoked ? 'Retirée le' : 'Expire le';
   const staffId = revoked ? sanction.revokedBy : sanction.moderatorId;
   const staffLabel = revoked ? 'Retrait effectué par' : 'Membre du staff';
-  const cascade = revoked ? `\n**Action :** retrait de ${tierNames[sanction.revocationCascadeFrom] || 'la sanction'} et des sanctions suivantes.` : '';
+  const cascade = revoked ? `\n**Action :** retrait de ${tierNames[sanction.revocationCascadeFrom] || 'la sanction'} ; les sanctions supérieures actives ont été rétrogradées d’un rang en conservant leur motif.` : '';
   return new EmbedBuilder().setColor(expired || cleared || revoked ? 0x95a5a6 : 0xe74c3c).setTitle(title)
     .setDescription(`**Personne :** <@${sanction.userId}>\n**${staffLabel} :** <@${staffId}>\n**Motif :** ${safeText(sanction.reason, 800)}\n**${dateLabel} :** ${displayDate(expired || cleared || revoked ? eventTime : sanction.expiresAt)}${sanction.type === 'suspension3Days' && (expired || cleared) ? '\nLes rôles Warn 1 et Warn 2 ont aussi été retirés.' : ''}${cascade}`)
     .setFooter({ text: `Sanction ${sanction.id}` }).setTimestamp(eventTime);
@@ -635,6 +654,9 @@ async function flushSanctionLogs() {
       catch (error) { console.error(`Journal de retrait ${sanction.id} indisponible (réessai automatique):`, error.message); }
     }
   }
+  const before = state.sanctions.length;
+  state.sanctions = state.sanctions.filter(s => !(['expired', 'cleared'].includes(s.status) && !s.expiryLogPending));
+  if (state.sanctions.length !== before) saveState();
   } finally { sanctionLogFlushRunning = false; }
 }
 let sanctionReconcilePromise = null;
