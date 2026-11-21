@@ -358,6 +358,7 @@ function sanctionPanelEmbed() {
 function sanctionPanelRow() {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('sanction:open').setLabel('Créer une sanction').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId('sanction:open-suspension').setLabel('Mise à pied 3 jours').setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId('sanction:remove').setLabel('Enlever une sanction').setStyle(ButtonStyle.Secondary)
   );
 }
@@ -417,8 +418,8 @@ function workflowFrom(interaction) {
   const w = wizardByMessage.get(interaction.message?.id);
   return w && w.ownerId === interaction.user.id && interaction.channelId === config.sanctionPanelChannelId ? w : null;
 }
-async function openSanctionWizard(interaction) {
-  const w = { kind: 'issue', ownerId: interaction.user.id, guildId, targetUserId: null, type: null, allowedTiers: ['warn1'], mentionRoleIds: [] };
+async function openSanctionWizard(interaction, quickSuspension = false) {
+  const w = { kind: 'issue', ownerId: interaction.user.id, guildId, targetUserId: null, type: quickSuspension ? 'suspension3Days' : null, allowedTiers: quickSuspension ? ['suspension3Days'] : ['warn1'], quickSuspension, mentionRoleIds: [] };
   const message = await interaction.reply({ content: sanctionWorkflowDescription(w), components: wizardComponents(w), ephemeral: true, fetchReply: true, allowedMentions: { parse: [] } });
   wizardByMessage.set(message.id, w);
   const timer = setTimeout(() => wizardByMessage.delete(message.id), 15 * 60_000); timer.unref?.();
@@ -430,7 +431,7 @@ async function openRevokeWizard(interaction) {
   const timer = setTimeout(() => wizardByMessage.delete(message.id), 15 * 60_000); timer.unref?.();
 }
 async function refreshWizard(interaction, w) {
-  const content = `${sanctionWorkflowDescription(w)}${w.reason ? `\n**Motif :** ${safeText(w.reason, 300)}` : ''}`;
+  const content = `${sanctionWorkflowDescription(w)}${w.notice ? `\n⚠️ ${w.notice}` : ''}${w.reason ? `\n**Motif :** ${safeText(w.reason, 300)}` : ''}`;
   const payload = { content, components: w.reason ? sanctionMentionComponents(w) : wizardComponents(w), allowedMentions: { parse: [] } };
   if (interaction.deferred) await interaction.editReply(payload);
   else await interaction.update(payload);
@@ -441,11 +442,11 @@ function createSanctionReasonModal(nonce) {
   );
 }
 async function handleSanctionInteraction(interaction) {
-  if (interaction.isButton() && interaction.customId === 'sanction:open') {
+  if (interaction.isButton() && ['sanction:open', 'sanction:open-suspension'].includes(interaction.customId)) {
     if (interaction.guildId !== guildId || interaction.channelId !== config.sanctionPanelChannelId) {
       await interaction.reply({ content: 'Utilise le panneau du salon de sanctions configuré.', ephemeral: true }); return true;
     }
-    await openSanctionWizard(interaction); return true;
+    await openSanctionWizard(interaction, interaction.customId === 'sanction:open-suspension'); return true;
   }
   if (interaction.isButton() && interaction.customId === 'sanction:remove') {
     if (interaction.guildId !== guildId || interaction.channelId !== config.sanctionPanelChannelId) {
@@ -467,7 +468,9 @@ async function handleSanctionInteraction(interaction) {
       return true;
     }
     w.allowedTiers = eligibleTiers(member);
+    if (w.quickSuspension) w.allowedTiers = w.allowedTiers.filter(type => type === 'suspension3Days');
     if (!w.allowedTiers.includes(w.type)) w.type = null;
+    w.notice = w.quickSuspension && !w.allowedTiers.length ? 'Cette personne doit avoir un Warn 1 et un Warn 2 actifs pour recevoir une mise à pied.' : null;
     await refreshWizard(interaction, w); return true;
   }
   if (interaction.isStringSelectMenu() && interaction.customId === 'sanction:tier') {
@@ -475,6 +478,7 @@ async function handleSanctionInteraction(interaction) {
     await interaction.deferUpdate();
     const member = w.targetUserId ? await interaction.guild.members.fetch({ user: w.targetUserId, force: true }).catch(() => null) : null;
     w.allowedTiers = w.kind === 'revoke' ? revocableTiers(member) : eligibleTiers(member);
+    if (w.quickSuspension) w.allowedTiers = w.allowedTiers.filter(type => type === 'suspension3Days');
     if (!w.allowedTiers.includes(interaction.values[0])) {
       w.type = null;
       const text = w.kind === 'revoke' ? '⚠️ Cette sanction n’est plus active.' : '⚠️ Cette sanction n’est pas disponible : la séquence de rôles requise n’est pas active.';
