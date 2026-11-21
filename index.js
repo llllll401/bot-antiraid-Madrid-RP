@@ -369,10 +369,12 @@ function sanctionWorkflowDescription(w) {
 function eligibleTiers(member) {
   if (!member) return [];
   const now = Date.now();
-  if (state.sanctions.some(s => s.userId === member.id && s.type === 'suspension3Days' && s.status === 'active')) return [];
-  const hasWarn1 = member.roles.cache.has(tierRoleId('warn1')) && activeFor(member.id, 'warn1', now).length > 0;
-  const hasWarn2 = member.roles.cache.has(tierRoleId('warn2')) && activeFor(member.id, 'warn2', now).length > 0;
-  return ['warn1', ...(hasWarn1 ? ['warn2'] : []), ...(hasWarn1 && hasWarn2 ? ['suspension3Days'] : [])];
+  if (state.sanctions.some(s => s.userId === member.id && s.type === 'suspension3Days' && s.status === 'active' && s.expiresAt > now)) return [];
+  const hasWarn1 = activeFor(member.id, 'warn1', now).length > 0;
+  const hasWarn2 = activeFor(member.id, 'warn2', now).length > 0;
+  if (hasWarn1 && hasWarn2) return ['suspension3Days'];
+  if (hasWarn1) return ['warn2'];
+  return ['warn1'];
 }
 function revocableTiers(member) {
   if (!member) return [];
