@@ -1,5 +1,5 @@
 const {
-  ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, EmbedBuilder, GatewayIntentBits,
+  ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, EmbedBuilder, GatewayIntentBits, SlashCommandBuilder,
   ModalBuilder, TextInputBuilder, TextInputStyle, UserSelectMenuBuilder,
   RoleSelectMenuBuilder, StringSelectMenuBuilder, StringSelectMenuOptionBuilder
 } = require('discord.js');
@@ -30,8 +30,20 @@ const dateFormatter = new Intl.DateTimeFormat('fr-FR', {
   hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
 });
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
+const AUTO_ROLE_COMMAND_NAME = 'sanctions-auto-role';
+const autoRoleCommand = new SlashCommandBuilder().setName(AUTO_ROLE_COMMAND_NAME)
+  .setDescription('Activer ou désactiver la remise automatique des rôles de sanction')
+  .addBooleanOption(option => option.setName('actif').setDescription('Activer la remise automatique').setRequired(true));
 
-function emptyState() { return { boardMessageId: null, requestPanelMessageId: null, sanctionPanelMessageId: null, absences: [], sanctions: [] }; }
+async function ensureAutoRoleCommand() {
+  const guild = await client.guilds.fetch(guildId);
+  const commands = await guild.commands.fetch();
+  const existing = commands.find(command => command.name === AUTO_ROLE_COMMAND_NAME);
+  if (existing) await guild.commands.edit(existing.id, autoRoleCommand.toJSON());
+  else await guild.commands.create(autoRoleCommand.toJSON());
+}
+
+function emptyState() { return { boardMessageId: null, requestPanelMessageId: null, sanctionPanelMessageId: null, autoRestoreSanctionRoles: true, absences: [], sanctions: [] }; }
 function isSnowflake(value) { return typeof value === 'string' && /^\d{17,20}$/.test(value); }
 function loadState() {
   let parsed;
@@ -62,6 +74,7 @@ function loadState() {
     boardMessageId: isSnowflake(parsed.boardMessageId) ? parsed.boardMessageId : null,
     requestPanelMessageId: isSnowflake(parsed.requestPanelMessageId) ? parsed.requestPanelMessageId : null,
     sanctionPanelMessageId: isSnowflake(parsed.sanctionPanelMessageId) ? parsed.sanctionPanelMessageId : null,
+    autoRestoreSanctionRoles: parsed.autoRestoreSanctionRoles !== false,
     absences, sanctions
   };
 }
@@ -627,7 +640,7 @@ function sanctionLogEmbed(sanction, mode = 'created') {
   const staffLabel = revoked ? 'Retrait effectué par' : 'Membre du staff';
   const cascade = revoked ? `\n**Action :** retrait de ${tierNames[sanction.revocationCascadeFrom] || 'la sanction'} ; les sanctions supérieures actives ont été rétrogradées d’un rang en conservant leur motif.` : '';
   return new EmbedBuilder().setColor(expired || cleared || revoked ? 0x95a5a6 : 0xe74c3c).setTitle(title)
-    .setDescription(`**Personne :** <@${sanction.userId}>\n**${staffLabel} :** <@${staffId}>\n**Motif :** ${safeText(sanction.reason, 800)}\n**${dateLabel} :** ${displayDate(expired || cleared || revoked ? eventTime : sanction.expiresAt)}${sanction.type === 'suspension3Days' && (expired || cleared) ? '\nLes rôles Warn 1 et Warn 2 ont aussi été retirés.' : ''}${cascade}`)
+    .setDescription(`**Personne :** <@${sanction.userId}>\n**${staffLabel} :** <@${staffId}>\n**Motif :** ${safeText(sanction.reason, 800)}\n**${dateLabel} :** ${displayDate(expired || cleared || revoked ? eventTime : sanction.expiresAt)}${sanction.type === 'suspension3Days' && (expired || cleared) ? '\nLes rôles Warn 1 et Warn 2 ont aussi été retirés.' : ''}${expired && sanction.promotedSanctionId ? '\nLe Warn 1 a expiré ; le Warn 2 suivant devient Warn 1 et son compte à rebours commence maintenant.' : ''}${cascade}`)
     .setFooter({ text: `Sanction ${sanction.id}` }).setTimestamp(eventTime);
 }
 async function sendSanctionLog(sanction, mode) {
@@ -692,6 +705,22 @@ async function reconcileSanctionsPass() {
         changed = true;
       }
     } else {
+      const expiredWarn1s = state.sanctions.filter(s => s.userId === userId && s.type === 'warn1' && s.status === 'active' && s.expiresAt <= now);
+      for (const warn1 of expiredWarn1s) {
+        warn1.status = 'expired'; warn1.expiryLogPending = true; warn1.expiryRolesSynced = false;
+        if (!warn1.roleApplied) warn1.createdLogPending = false;
+        const nextWarn = state.sanctions.filter(s => s.userId === userId && s.type === 'warn2' && s.status === 'active' && s.expiresAt > now)
+          .sort((a, b) => a.expiresAt - b.expiresAt)[0];
+        if (nextWarn) {
+          nextWarn.type = 'warn1';
+          nextWarn.typeBeforePromotion = 'warn2';
+          nextWarn.promotedAt = now;
+          nextWarn.promotionReason = 'warn1_expired';
+          nextWarn.parentWarn1Id = null;
+          warn1.promotedSanctionId = nextWarn.id;
+        }
+        changed = true;
+      }
       for (const sanction of state.sanctions.filter(s => s.userId === userId && ['warn1', 'warn2'].includes(s.type) && s.status === 'active' && s.expiresAt <= now)) {
         sanction.status = 'expired'; sanction.expiryLogPending = true; sanction.expiryRolesSynced = false;
         if (!sanction.roleApplied) sanction.createdLogPending = false;
@@ -713,10 +742,15 @@ async function reconcileSanctionsPass() {
       continue;
     }
     const active = state.sanctions.filter(s => s.userId === userId && s.status === 'active');
+    for (const sanction of active) {
+      const rolePresent = member.roles.cache.has(tierRoleId(sanction.type));
+      if (!state.autoRestoreSanctionRoles && !rolePresent && !sanction.roleRestoreSuppressed) { sanction.roleRestoreSuppressed = true; changed = true; }
+      else if (rolePresent && sanction.roleRestoreSuppressed) { delete sanction.roleRestoreSuppressed; changed = true; }
+    }
     const hasSuspension = active.some(s => s.type === 'suspension3Days');
     const desired = new Set(); let roleSyncSucceeded = true;
-    for (const type of ['warn1', 'warn2']) if (hasSuspension || active.some(s => s.type === type && s.expiresAt > Date.now())) desired.add(tierRoleId(type));
-    if (hasSuspension) desired.add(tierRoleId('suspension3Days'));
+    for (const type of ['warn1', 'warn2']) if (active.some(s => s.type === type && (hasSuspension || s.expiresAt > Date.now()) && !s.roleRestoreSuppressed)) desired.add(tierRoleId(type));
+    if (hasSuspension && active.some(s => s.type === 'suspension3Days' && !s.roleRestoreSuppressed)) desired.add(tierRoleId('suspension3Days'));
     for (const type of ['warn1', 'warn2', 'suspension3Days']) {
       const roleId = tierRoleId(type); const present = member.roles.cache.has(roleId); const want = desired.has(roleId);
       try {
@@ -734,7 +768,7 @@ async function reconcileSanctionsPass() {
     }
     for (const sanction of active) {
       if (!sanction.roleApplied && member.roles.cache.has(tierRoleId(sanction.type))) { sanction.roleApplied = true; changed = true; }
-      if (!sanction.roleApplied && sanction.expiresAt > Date.now()) {
+      if (state.autoRestoreSanctionRoles && !sanction.roleRestoreSuppressed && !sanction.roleApplied && sanction.expiresAt > Date.now()) {
         try { await member.roles.add(tierRoleId(sanction.type), 'Restauration d’une sanction persistée'); sanction.roleApplied = true; changed = true; }
         catch (error) { console.error(`Restauration du rôle de sanction impossible pour ${userId}:`, error.message); }
       }
@@ -770,15 +804,32 @@ async function checkSanctionPanel() {
 async function checkRequestPanel() {
   await checkPersistentPanel(config.absenceRequestChannelId, 'requestPanelMessageId', { embeds: [createPanelEmbed()], components: [createPanelRow()] }, 'demandes d’absence');
 }
+async function handleAutoRoleCommand(interaction) {
+  if (!interaction.isChatInputCommand() || interaction.commandName !== AUTO_ROLE_COMMAND_NAME) return false;
+  if (interaction.user.id !== '1239641924407660604') {
+    await interaction.reply({ content: 'Tu n’es pas autorisé à modifier ce réglage.', ephemeral: true }); return true;
+  }
+  if (interaction.guildId !== guildId) {
+    await interaction.reply({ content: 'Cette commande est disponible uniquement sur le serveur configuré.', ephemeral: true }); return true;
+  }
+  const previous = state.autoRestoreSanctionRoles;
+  state.autoRestoreSanctionRoles = interaction.options.getBoolean('actif', true);
+  try { saveState(); }
+  catch (error) {
+    state.autoRestoreSanctionRoles = previous;
+    console.error('Enregistrement du réglage de remise automatique impossible :', error);
+    await interaction.reply({ content: 'Le réglage n’a pas pu être enregistré.', ephemeral: true }); return true;
+  }
+  await interaction.deferReply({ ephemeral: true });
+  await reconcileSanctions().catch(error => console.error('Réconciliation après changement du réglage impossible :', error));
+  await interaction.editReply(state.autoRestoreSanctionRoles
+    ? 'La remise automatique des rôles de sanction est activée. Les rôles retirés pendant qu’elle était désactivée ne seront pas remis automatiquement.'
+    : 'La remise automatique des rôles de sanction est désactivée. Les rôles retirés pendant cette période ne seront pas remis automatiquement.');
+  return true;
+}
 client.once('ready', async () => {
-  try {
-    await client.application.commands.set([], guildId);
-    console.log('Commandes slash du serveur supprimées.');
-  } catch (error) { console.error('Réinitialisation des commandes slash du serveur impossible :', error.message); }
-  try {
-    await client.application.commands.set([]);
-    console.log('Commandes slash globales supprimées.');
-  } catch (error) { console.error('Réinitialisation des commandes slash globales impossible :', error.message); }
+  try { await ensureAutoRoleCommand(); console.log(`Commande /${AUTO_ROLE_COMMAND_NAME} enregistrée.`); }
+  catch (error) { console.error('Enregistrement de la commande de remise automatique impossible :', error.message); }
   console.log(`Connecté en tant que ${client.user.tag} — serveur ${guildId}`);
   await ensureRequestPanel();
   await refreshBoard();
@@ -793,6 +844,7 @@ client.once('ready', async () => {
 });
 client.on('interactionCreate', async interaction => {
   try {
+    if (await handleAutoRoleCommand(interaction)) return;
     if (await handleSanctionInteraction(interaction)) return;
     if (interaction.guildId !== guildId) return;
     if (await handleAbsenceCancellation(interaction)) return;
