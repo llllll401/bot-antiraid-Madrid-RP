@@ -368,7 +368,7 @@ function sanctionPanelRow() {
 }
 function sanctionWorkflowDescription(w) {
   if (w.kind === 'revoke') return `**Personne :** ${w.targetUserId ? `<@${w.targetUserId}>` : 'à choisir'}\n**Sanction à retirer :** ${w.type ? tierNames[w.type] : 'à choisir'}`;
-  return `**Personne :** ${w.targetUserId ? `<@${w.targetUserId}>` : 'à choisir'}\n**Sanction :** ${w.type ? tierNames[w.type] : 'à choisir'}\n**Rôles à mentionner :** ${w.mentionRoleIds.length ? w.mentionRoleIds.map(id => `<@&${id}>`).join(' ') : 'aucun'}`;
+  return `**Personne :** ${w.targetUserId ? `<@${w.targetUserId}>` : 'à choisir'}\n**Sanction qui sera appliquée :** ${w.type ? tierNames[w.type] : w.targetUserId ? 'aucune disponible' : 'déterminée automatiquement après le choix de la personne'}\n**Rôles à mentionner :** ${w.mentionRoleIds.length ? w.mentionRoleIds.map(id => `<@&${id}>`).join(' ') : 'aucun'}`;
 }
 function eligibleTiers(member) {
   if (!member) return [];
@@ -401,17 +401,10 @@ function revokeWizardComponents(w) {
   ];
 }
 function wizardComponents(w) {
-  const userSelect = new UserSelectMenuBuilder().setCustomId('sanction:target').setPlaceholder('1. Choisir la personne').setMinValues(1).setMaxValues(1);
+  const userSelect = new UserSelectMenuBuilder().setCustomId('sanction:target').setPlaceholder('Choisir la personne').setMinValues(1).setMaxValues(1);
   if (w.targetUserId) userSelect.setDefaultUsers(w.targetUserId);
-  const tierOptions = !w.targetUserId
-    ? [new StringSelectMenuOptionBuilder().setLabel('Choisis d’abord une personne').setValue('none')]
-    : w.allowedTiers?.length
-      ? w.allowedTiers.map(type => new StringSelectMenuOptionBuilder().setLabel(tierNames[type]).setValue(type).setDefault(w.type === type))
-      : [new StringSelectMenuOptionBuilder().setLabel('Aucune sanction disponible').setValue('none')];
-  const tierSelect = new StringSelectMenuBuilder().setCustomId('sanction:tier').setPlaceholder('2. Choisir une sanction disponible').setMinValues(1).setMaxValues(1).addOptions(tierOptions);
   return [
     new ActionRowBuilder().addComponents(userSelect),
-    new ActionRowBuilder().addComponents(tierSelect),
     new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('sanction:continue').setLabel('Continuer vers le motif').setStyle(ButtonStyle.Primary).setDisabled(!w.targetUserId || !w.type))
   ];
 }
@@ -481,11 +474,15 @@ async function handleSanctionInteraction(interaction) {
       return true;
     }
     w.allowedTiers = eligibleTiers(member);
-    if (w.quickSuspension) {
-      w.allowedTiers = w.allowedTiers.filter(type => type === 'suspension3Days');
-      w.type = w.allowedTiers.includes('suspension3Days') ? 'suspension3Days' : null;
-    } else if (!w.allowedTiers.includes(w.type)) w.type = w.allowedTiers.length === 1 ? w.allowedTiers[0] : null;
-    w.notice = w.quickSuspension && !w.allowedTiers.length ? 'Cette personne doit avoir un Warn 1 et un Warn 2 actifs pour recevoir une mise à pied.' : null;
+    if (w.quickSuspension) w.allowedTiers = w.allowedTiers.filter(type => type === 'suspension3Days');
+    w.type = w.allowedTiers[0] || null;
+    w.notice = null;
+    if (!w.type) {
+      const existingSuspension = activeFor(member.id, 'suspension3Days').sort((a, b) => a.expiresAt - b.expiresAt)[0];
+      if (existingSuspension) w.notice = `Une mise à pied est déjà active jusqu’au ${displayDate(existingSuspension.expiresAt)}. Les sanctions enregistrées font foi, même si un rôle n’est plus visible.`;
+      else if (w.quickSuspension) w.notice = 'Une mise à pied exige un Warn 1 et un Warn 2 actifs.';
+      else w.notice = 'Aucune nouvelle sanction n’est disponible pour cette personne.';
+    }
     await refreshWizard(interaction, w); return true;
   }
   if (interaction.isStringSelectMenu() && interaction.customId === 'sanction:tier') {
