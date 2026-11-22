@@ -14,7 +14,7 @@ Au démarrage, le bot enregistre ou met à jour uniquement la commande slash `/s
 ## Salons et sanctions dans `config.json`
 
 - `sanctionPanelChannelId` : salon du panneau persistant « Créer une sanction ».
-- `sanctionLogChannelId` : journal des sanctions et de leurs expirations. Les rôles choisis dans le sélecteur sont réellement mentionnés/pingés à la création.
+- `sanctionLogChannelId` : journal des sanctions et de leurs expirations. À la création d’une sanction, la personne sanctionnée et les rôles choisis sont réellement mentionnés/pingés au-dessus de l’embed.
 - `sanctionRoles.warn1`, `sanctionRoles.warn2`, `sanctionRoles.suspension3Days` : IDs des trois rôles de sanction.
 - `sanctionDurationsDays` : durées configurables ; par défaut Warn 1 = 7 jours, Warn 2 = 7 jours après l’expiration du Warn 1 lié (son rôle est ajouté dès l’application), et mise à pied = 3 jours.
 

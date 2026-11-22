@@ -662,8 +662,12 @@ function sanctionLogEmbed(sanction, mode = 'created') {
 }
 async function sendSanctionLog(sanction, mode) {
   const channel = await fetchTextChannel(config.sanctionLogChannelId);
-  const content = mode === 'created' && sanction.mentionRoleIds?.length ? sanction.mentionRoleIds.map(id => `<@&${id}>`).join(' ') : undefined;
-  await channel.send({ content, embeds: [sanctionLogEmbed(sanction, mode)], allowedMentions: { parse: [], roles: mode === 'created' ? sanction.mentionRoleIds || [] : [] } });
+  const content = mode === 'created'
+    ? [`<@${sanction.userId}>`, ...(sanction.mentionRoleIds || []).map(id => `<@&${id}>`)].join(' ')
+    : undefined;
+  await channel.send({ content, embeds: [sanctionLogEmbed(sanction, mode)], allowedMentions: {
+    parse: [], users: mode === 'created' ? [sanction.userId] : [], roles: mode === 'created' ? sanction.mentionRoleIds || [] : []
+  } });
 }
 let sanctionLogFlushRunning = false;
 async function flushSanctionLogs() {
