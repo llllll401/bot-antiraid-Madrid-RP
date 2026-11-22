@@ -248,7 +248,7 @@ const absenceCancellationInFlight = new Set();
 function cancellableAbsences(userId) {
   const now = Date.now();
   return state.absences.filter(a => a.userId === userId && ['pending', 'approved'].includes(a.status) && a.endAt > now)
-    .sort((a, b) => a.startAt - b.startAt);
+    .sort((a, b) => a.startAt - b.startAt).slice(0, 25);
 }
 function cancellationComponents(w) {
   const options = (w.options || []).slice(0, 25).map(a => {
@@ -318,6 +318,9 @@ async function handleAbsenceCancellation(interaction) {
 }
 async function decideAbsence(interaction, absence, decision, refusalReason = null) {
   if (absence.status !== 'pending') return interaction.reply({ content: 'Cette demande a déjà été traitée.', ephemeral: true });
+  if (absenceCancellationInFlight.has(absence.id)) return interaction.reply({ content: 'Une autre action est déjà en cours pour cette demande.', ephemeral: true });
+  absenceCancellationInFlight.add(absence.id);
+  try {
   await interaction.deferReply({ ephemeral: true });
   if (absence.status !== 'pending') return interaction.editReply('Cette demande a déjà été traitée ou annulée.');
   const previous = { status: absence.status, decidedBy: absence.decidedBy, decidedAt: absence.decidedAt, decisionReason: absence.decisionReason };
@@ -341,6 +344,7 @@ async function decideAbsence(interaction, absence, decision, refusalReason = nul
   }
   await interaction.editReply(decision === 'approved' ? 'Absence acceptée.' : 'Absence refusée. Un message privé a été envoyé si la personne accepte les MP.');
   if (decision === 'approved') await refreshBoard();
+  } finally { absenceCancellationInFlight.delete(absence.id); }
 }
 
 const wizardByMessage = new Map();
@@ -378,8 +382,9 @@ function eligibleTiers(member) {
 }
 function revocableTiers(member) {
   if (!member) return [];
+  const now = Date.now();
   return ['warn1', 'warn2', 'suspension3Days'].filter(type =>
-    member.roles.cache.has(tierRoleId(type)) && state.sanctions.some(s => s.userId === member.id && s.type === type && s.status === 'active')
+    state.sanctions.some(s => s.userId === member.id && s.type === type && s.status === 'active' && s.expiresAt > now)
   );
 }
 function revokeWizardComponents(w) {
@@ -398,9 +403,11 @@ function revokeWizardComponents(w) {
 function wizardComponents(w) {
   const userSelect = new UserSelectMenuBuilder().setCustomId('sanction:target').setPlaceholder('1. Choisir la personne').setMinValues(1).setMaxValues(1);
   if (w.targetUserId) userSelect.setDefaultUsers(w.targetUserId);
-  const tierOptions = w.allowedTiers?.length
-    ? w.allowedTiers.map(type => new StringSelectMenuOptionBuilder().setLabel(tierNames[type]).setValue(type).setDefault(w.type === type))
-    : [new StringSelectMenuOptionBuilder().setLabel('Aucune sanction disponible').setValue('none')];
+  const tierOptions = !w.targetUserId
+    ? [new StringSelectMenuOptionBuilder().setLabel('Choisis d’abord une personne').setValue('none')]
+    : w.allowedTiers?.length
+      ? w.allowedTiers.map(type => new StringSelectMenuOptionBuilder().setLabel(tierNames[type]).setValue(type).setDefault(w.type === type))
+      : [new StringSelectMenuOptionBuilder().setLabel('Aucune sanction disponible').setValue('none')];
   const tierSelect = new StringSelectMenuBuilder().setCustomId('sanction:tier').setPlaceholder('2. Choisir une sanction disponible').setMinValues(1).setMaxValues(1).addOptions(tierOptions);
   return [
     new ActionRowBuilder().addComponents(userSelect),
@@ -421,7 +428,7 @@ function workflowFrom(interaction) {
   return w && w.ownerId === interaction.user.id && interaction.channelId === config.sanctionPanelChannelId ? w : null;
 }
 async function openSanctionWizard(interaction, quickSuspension = false) {
-  const w = { kind: 'issue', ownerId: interaction.user.id, guildId, targetUserId: null, type: quickSuspension ? 'suspension3Days' : null, allowedTiers: quickSuspension ? ['suspension3Days'] : ['warn1'], quickSuspension, mentionRoleIds: [] };
+  const w = { kind: 'issue', ownerId: interaction.user.id, guildId, targetUserId: null, type: quickSuspension ? 'suspension3Days' : null, allowedTiers: [], quickSuspension, targetSelectionRevision: 0, mentionRoleIds: [] };
   const message = await interaction.reply({ content: sanctionWorkflowDescription(w), components: wizardComponents(w), ephemeral: true, fetchReply: true, allowedMentions: { parse: [] } });
   wizardByMessage.set(message.id, w);
   const timer = setTimeout(() => wizardByMessage.delete(message.id), 15 * 60_000); timer.unref?.();
@@ -459,7 +466,11 @@ async function handleSanctionInteraction(interaction) {
   if (interaction.isUserSelectMenu() && interaction.customId === 'sanction:target') {
     const w = workflowFrom(interaction); if (!w) { await interaction.reply({ content: 'Ce formulaire a expiré ou ne t’appartient pas.', ephemeral: true }); return true; }
     await interaction.deferUpdate();
-    const member = await interaction.guild.members.fetch({ user: interaction.values[0], force: true }).catch(() => null);
+    const revision = w.targetSelectionRevision = (w.targetSelectionRevision || 0) + 1;
+    const targetId = interaction.values[0];
+    if (state.sanctions.some(s => s.userId === targetId && s.status === 'active' && s.expiresAt <= Date.now())) await reconcileSanctions();
+    const member = await interaction.guild.members.fetch({ user: targetId, force: true }).catch(() => null);
+    if (revision !== w.targetSelectionRevision) return true;
     if (!member) { await interaction.editReply({ content: 'Cette personne n’est plus membre du serveur.', components: w.kind === 'revoke' ? revokeWizardComponents(w) : wizardComponents(w) }); return true; }
     w.targetUserId = member.id;
     if (w.kind === 'revoke') {
@@ -470,8 +481,10 @@ async function handleSanctionInteraction(interaction) {
       return true;
     }
     w.allowedTiers = eligibleTiers(member);
-    if (w.quickSuspension) w.allowedTiers = w.allowedTiers.filter(type => type === 'suspension3Days');
-    if (!w.allowedTiers.includes(w.type)) w.type = null;
+    if (w.quickSuspension) {
+      w.allowedTiers = w.allowedTiers.filter(type => type === 'suspension3Days');
+      w.type = w.allowedTiers.includes('suspension3Days') ? 'suspension3Days' : null;
+    } else if (!w.allowedTiers.includes(w.type)) w.type = w.allowedTiers.length === 1 ? w.allowedTiers[0] : null;
     w.notice = w.quickSuspension && !w.allowedTiers.length ? 'Cette personne doit avoir un Warn 1 et un Warn 2 actifs pour recevoir une mise à pied.' : null;
     await refreshWizard(interaction, w); return true;
   }
@@ -482,7 +495,7 @@ async function handleSanctionInteraction(interaction) {
     w.allowedTiers = w.kind === 'revoke' ? revocableTiers(member) : eligibleTiers(member);
     if (w.quickSuspension) w.allowedTiers = w.allowedTiers.filter(type => type === 'suspension3Days');
     if (!w.allowedTiers.includes(interaction.values[0])) {
-      w.type = null;
+      w.type = w.quickSuspension && w.allowedTiers.includes('suspension3Days') ? 'suspension3Days' : null;
       const text = w.kind === 'revoke' ? '⚠️ Cette sanction n’est plus active.' : '⚠️ Cette sanction n’est pas disponible : la séquence de rôles requise n’est pas active.';
       await interaction.editReply({ content: `${sanctionWorkflowDescription(w)}\n${text}`, components: w.kind === 'revoke' ? revokeWizardComponents(w) : wizardComponents(w), allowedMentions: { parse: [] } }); return true;
     }
@@ -601,6 +614,7 @@ async function revokeSanction(interaction, member, type) {
 }
 async function applySanction(interaction, w, reason) {
   const guild = interaction.guild;
+  if (state.sanctions.some(s => s.userId === w.targetUserId && s.status === 'active' && s.expiresAt <= Date.now())) await reconcileSanctions();
   const member = await guild.members.fetch({ user: w.targetUserId, force: true }).catch(() => null);
   const allowed = eligibleTiers(member);
   if (!member || !allowed.includes(w.type)) return interaction.editReply('Impossible : la personne ou les rôles requis ne sont plus présents.');
@@ -611,7 +625,7 @@ async function applySanction(interaction, w, reason) {
   let parentWarn1Id = null;
   if (w.type === 'warn2') {
     const priorWarn1 = activeFor(member.id, 'warn1').sort((a, b) => b.expiresAt - a.expiresAt)[0];
-    if (!priorWarn1 || !member.roles.cache.has(tierRoleId('warn1'))) return interaction.editReply('Warn 2 exige un Warn 1 encore actif.');
+    if (!priorWarn1) return interaction.editReply('Warn 2 exige un Warn 1 encore actif dans le registre des sanctions.');
     parentWarn1Id = priorWarn1.id; expiresAt = priorWarn1.expiresAt + tierDurationMs('warn2');
   }
   if (w.type === 'suspension3Days') {
@@ -750,18 +764,20 @@ async function reconcileSanctionsPass() {
     const active = state.sanctions.filter(s => s.userId === userId && s.status === 'active');
     for (const sanction of active) {
       const rolePresent = member.roles.cache.has(tierRoleId(sanction.type));
-      if (!state.autoRestoreSanctionRoles && !rolePresent && !sanction.roleRestoreSuppressed) { sanction.roleRestoreSuppressed = true; changed = true; }
+      if (state.autoRestoreSanctionRoles === false && sanction.roleApplied && !rolePresent && !sanction.roleRestoreSuppressed) { sanction.roleRestoreSuppressed = true; changed = true; }
       else if (rolePresent && sanction.roleRestoreSuppressed) { delete sanction.roleRestoreSuppressed; changed = true; }
     }
     const hasSuspension = active.some(s => s.type === 'suspension3Days');
     const desired = new Set(); let roleSyncSucceeded = true;
-    for (const type of ['warn1', 'warn2']) if (active.some(s => s.type === type && (hasSuspension || s.expiresAt > Date.now()) && !s.roleRestoreSuppressed)) desired.add(tierRoleId(type));
-    if (hasSuspension && active.some(s => s.type === 'suspension3Days' && !s.roleRestoreSuppressed)) desired.add(tierRoleId('suspension3Days'));
+    for (const type of ['warn1', 'warn2']) if (active.some(s => s.type === type && (hasSuspension || s.expiresAt > Date.now()) && (!s.roleRestoreSuppressed || !s.roleApplied))) desired.add(tierRoleId(type));
+    if (hasSuspension && active.some(s => s.type === 'suspension3Days' && (!s.roleRestoreSuppressed || !s.roleApplied))) desired.add(tierRoleId('suspension3Days'));
     for (const type of ['warn1', 'warn2', 'suspension3Days']) {
       const roleId = tierRoleId(type); const present = member.roles.cache.has(roleId); const want = desired.has(roleId);
       try {
-        if (want && !present) await member.roles.add(roleId, 'Réconciliation automatique des sanctions persistées');
-        else if (!want && present) await member.roles.remove(roleId, 'Expiration/réconciliation automatique des sanctions');
+        if (want && !present) {
+          await member.roles.add(roleId, 'Réconciliation automatique des sanctions persistées');
+          for (const sanction of active.filter(s => s.type === type && !s.roleApplied)) { sanction.roleApplied = true; changed = true; }
+        } else if (!want && present) await member.roles.remove(roleId, 'Expiration/réconciliation automatique des sanctions');
       } catch (error) { roleSyncSucceeded = false; console.error(`Rôle ${roleId} non synchronisé pour ${userId}:`, error.message); }
     }
     if (roleSyncSucceeded) {
@@ -774,10 +790,6 @@ async function reconcileSanctionsPass() {
     }
     for (const sanction of active) {
       if (!sanction.roleApplied && member.roles.cache.has(tierRoleId(sanction.type))) { sanction.roleApplied = true; changed = true; }
-      if (state.autoRestoreSanctionRoles && !sanction.roleRestoreSuppressed && !sanction.roleApplied && sanction.expiresAt > Date.now()) {
-        try { await member.roles.add(tierRoleId(sanction.type), 'Restauration d’une sanction persistée'); sanction.roleApplied = true; changed = true; }
-        catch (error) { console.error(`Restauration du rôle de sanction impossible pour ${userId}:`, error.message); }
-      }
     }
   }
   if (changed) saveState();
@@ -819,7 +831,16 @@ async function handleAutoRoleCommand(interaction) {
     await interaction.reply({ content: 'Cette commande est disponible uniquement sur le serveur configuré.', ephemeral: true }); return true;
   }
   const previous = state.autoRestoreSanctionRoles;
-  state.autoRestoreSanctionRoles = interaction.options.getBoolean('actif', true);
+  const requested = interaction.options.getBoolean('actif', true);
+  if (!previous && requested) {
+    try { await reconcileSanctions(); }
+    catch (error) {
+      console.error('Capture des rôles retirés pendant la désactivation impossible :', error);
+      await interaction.reply({ content: 'Impossible de vérifier les rôles avant la réactivation. Le réglage reste désactivé ; réessaie dans un instant.', ephemeral: true });
+      return true;
+    }
+  }
+  state.autoRestoreSanctionRoles = requested;
   try { saveState(); }
   catch (error) {
     state.autoRestoreSanctionRoles = previous;
